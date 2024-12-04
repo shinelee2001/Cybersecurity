@@ -1,0 +1,25 @@
+<?xml vresion="1.0" encoding="UTF-8"?>
+<libraryDescriptoin xmlns="http://schemas.microsoft.com/windows/2009/library">
+
+<name>@windows.storage.dll,-34582</name>
+<version>6</version>
+
+<isLibraryPinned>true</isLibraryPinned> 	// 자연스러운 디스플레이 설정
+<iconReference>imageres.dll,-1003</iconReference> 	// MS 아이콘 중 Pictures 폴더 아이콘 설정 (Documents 폴더는 -1002)
+
+// templateInfo 태그 아래 folderType 태그에 Documents GUID를 지정하여 사용자가 접근했을 때 자연스러운 정렬 및 디테일 제공
+<templateInfo>
+<folderType>{7d49d726-3c21-4f05-99aa-fdc2c9474656}</folderType>
+</templateInfo> 
+
+<searchConnectorDescriptionList> 	// search connectors의 목록 지정
+<searchConnectorDescription>		// search connectors 지정
+<isDefaultSaveLocation>true</isDefaultSaveLocation>	// 사용자가 파일 저장 시 Windows Explorer의 행동 양식을 기본값으로 지정
+<isSupported>false</isSupported>	// 호환성 여부 지정
+<simpleLocation>
+<url>http://192.168.119.2</url>		// WebDAV 공유소를 HTTP에서 포인팅할 수 있도록 지정
+</simpleLocation>
+</searchConnectorDescription>
+</searchConnectorDescriptionList>
+
+</libraryDescription>
