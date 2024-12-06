@@ -1,0 +1,5 @@
+hydra
+-l / -L (listing) : login user
+-p / -P (listing) : password
+-s : Port number
+http-post-form "[/web login page]:[login_user=username&login_passwd=^PASS^]:[Login Failed Message]"
