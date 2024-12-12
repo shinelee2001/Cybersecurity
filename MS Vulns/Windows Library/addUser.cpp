@@ -1,3 +1,4 @@
+// Compile as DLL with --shared option in gcc.
 #include <stdlib.h>
 #include <windows.h>
 
