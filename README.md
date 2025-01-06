@@ -1,1 +1,1 @@
-All the informations I learned while studying Information Security
+All the information I learn from studying Information Security
