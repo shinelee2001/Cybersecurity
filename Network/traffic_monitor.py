@@ -46,17 +46,23 @@ def get_host_info(ip):
     Windows에서는 nslookup, Linux에서는 host 명령어를 사용하여 IP 주소에 대한 도메인 정보를 조회합니다.
     """
     system_platform = platform.system().lower()
+
     try:
         if system_platform == "windows":
             result = subprocess.run(["nslookup", ip], capture_output=True, text=True)
-        else:
+        if system_platform == "linux":
             result = subprocess.run(["host", ip], capture_output=True, text=True)
+        else:
+            return "The OS is neither winodws nor linux."
+
 
         if result.returncode == 0:
             # nslookup 또는 host 명령어의 출력에서 도메인 정보 추출
             output = result.stdout.strip()
 
-            # Windows의 경우, 'Name:'과 'Address:' 다음에 나오는 정보를 추출
+            print(output)
+
+            # Windows의 경우, 'Name: ' 다음에 나오는 정보를 추출
             if system_platform == "windows":
                 # 정규 표현식을 사용하여 도메인과 IP를 추출
                 domain_info = re.search(r"Name:\s+([^\n]+)", output)
@@ -64,9 +70,14 @@ def get_host_info(ip):
                     return domain_info.group(1).strip()
                 else:
                     return "No domain information found"
-            else:
-                # Linux의 경우, 단순히 IP와 도메인 이름을 추출
-                return output
+
+            # Linux의 경우, 'name pointer' 다음에 나오는 정보 추출
+            if system_platform == "linux":
+                domain_info = re.search(r"pointer\s+([^\n]+)", output)
+                if domain_info:
+                    return domain_info.group(1).strip()
+                else:
+                    return "No domain information found"
         else:
             return "No domain information found"
     except Exception as e:
@@ -99,8 +110,9 @@ def display_stats():
 
 
 if __name__ == "__main__":
-    # interface = input("Enter the network interface to monitor (e.g., eth0, wlan0): ")
-    # print(f"[*] Sniffing on {interface}...")
+
+    interface = input("Enter the network interface to monitor (e.g., eth0, wlan0): ")
+    print(f"[*] Sniffing on {interface}...")
 
     # 실시간 통계 표시를 위한 스레드 실행
     stats_thread = threading.Thread(target=display_stats, daemon=True)
@@ -108,7 +120,7 @@ if __name__ == "__main__":
 
     # 패킷 캡처 시작
     try:
-        sniff(iface="Wi-Fi", prn=packet_callback, store=False)
+        sniff(iface=interface, prn=packet_callback, store=False)
     except PermissionError:
         print(
             "[!] Permission denied: Run the script with elevated privileges (e.g., sudo)."
