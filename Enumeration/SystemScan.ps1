@@ -6,7 +6,7 @@
 # xxx is the number of days, default 56 days (8 weeks)
 
 #
-# Check out the SystemScan.README.txt for command line run instructions.
+# Check out the SystemScan.README.txt(.ps1) for command line run instructions.
 
 #
 # Captures System Details: Logs the computer name, Windows version, and current username.
@@ -138,9 +138,8 @@ Write-Host  "`n***   Scanning Recycle Bin..."
 
 ### Scan Additional Partitions & USB Drives ###
 # Get all non-C: drives, exclude USB (DriveType = 2)
-# (2025-11-05) Skipping network drive (DriveType = 4)
 $nonUSBDrives = Get-CimInstance Win32_LogicalDisk | Where-Object {
-    $_.DeviceID -ne 'C:' -and $_.DriveType -notin 2, 4
+    $_.DeviceID -ne 'C:' -and $_.DriveType -notin 2
 }
 
 # Get corresponding PowerShell drives (PSDrive) for safe access
@@ -152,21 +151,21 @@ foreach ($drive in $nonUSBDrives) {
     }
 }
 
-
-
-# Some large directories
-
-function Get-DriveFilesSafe {
+# (2025-11-05) Helper to verify drive readability
+function Test-DriveReadable {
 	param(
-		[string]$Root,
-		[string[]]$Extensions
+		[string]$driveRoot
 	)
 	
+	if (-not (Test-Path -LiteralPath $driveRoot)) {return [PSCustomObject]@{Readable=$false; Reason='NotFound'}}
+	try {
+		&{Get-ChildItem -LiteralPath $driveRoot -Force -Depth 0 -ErrorAction Stop | Out-Null} 2>$null
+		return [PSCustomObject]@{Readable=$true; Reason=$null}
+	}
+	catch [System.UnauthorizedAccessException] {return [PSCustomObject]@{Readable=$false; Reason='AccessDenied'}}
+	catch [System.IO.IOException] {return [PSCustomObject]@{Readable=$false; Reason='IOError'}}
+	catch {return [PSCustomObject]@{Readable=$false; Reason=$_.Exception.Message}}
 }
-
-
-
-
 
 if ($extraDrives) {
     Write-Host  "`n************************************************************"
@@ -179,16 +178,29 @@ if ($extraDrives) {
 		#	- In general, the error occurs when the drive is too large and the scanning process runs out of memory.
 		$driveLetter = $drive.Root
 		Write-Host "***   Scanning drive: $driveLetter"
+		
+		$probe = Test-DriveReadable -driveRoot $driveLetter
+		
+		# (2025-11-05) Minor fixes
+		# 	- Improving error handling cases
+		if (-not $probe.Readable) {
+			Write-Host ("***   Skipped while scanning drive $driveLetter. Reason: $probe.Reason")
+		}
+		
+		
 		try {
 			# (2025-10-23) Added a condition "-and ($_.Length -gt 0)" to ignore file with size 0
 			#	- In this way, we can also ignore cloud-only files existing in the endpoint.
 			# 	- The local keeps the inks of cloud-only files, which are of size 0 on disk.
 			# (2025-11-05) Minor fixes
-			#	- Unwanted error message fix by adding "-ErrorAction Stop 2>$null" (The error message will be displayed at 'catch')
 			#	- Skipping symbolic links (ReparsePoint in Windows) while scanning by adding "-Attributes !ReparsePoint"
-			$files = Get-ChildItem -Path $driveLetter -Recurse -File -Attributes !ReparsePoint -ErrorAction Stop 2>$null | 
-                 Where-Object { ($_.LastWriteTime -ge $dateThreshold -or $_.CreationTime -ge $dateThreshold) -and ($_.Extension -in $dataFileExtensions) -and ($_.Length -gt 0)} |
-                 Select-Object FullName, LastWriteTime, CreationTime
+			#   - Improving error handling cases
+			$files = & {
+				Get-ChildItem -Path $driveLetter -Recurse -File -Attributes !ReparsePoint -ErrorAction Stop | 
+				Where-Object { ($_.LastWriteTime -ge $dateThreshold -or $_.CreationTime -ge $dateThreshold) -and ($_.Extension -in $dataFileExtensions) -and ($_.Length -gt 0)} | 
+				Select-Object FullName, LastWriteTime, CreationTime
+			} 2>$null
+			
 			$totalFiles += $files.Count # 2025-07-16
 
 			if ($files.Count -gt 0) {
@@ -259,8 +271,8 @@ function Get-DocxText {
     if (Test-Path -LiteralPath $tmpZip) { Remove-Item -Force $tmpZip }
 	
 	# Unzip the document in temp folder
-	Copy-Item $Path $tmpZip
-	Expand-Archive -Path $tmpZip -DestinationPath $tmpFolder -Force
+	Copy-Item -LiteralPath $Path $tmpZip
+	Expand-Archive -LiteralPath $tmpZip -DestinationPath $tmpFolder -Force
 	
 	
 	# (2025-11-05) Scanning logic fix for docx
@@ -305,8 +317,8 @@ function Get-PptxSlidesText {
     if (Test-Path -LiteralPath $tmpZip)    { Remove-Item -Force $tmpZip }
 
 	# Unzip the document in temp folder
-	Copy-Item $Path $tmpZip -Force
-	Expand-Archive -Path $tmpZip -DestinationPath $tmpFolder -Force
+	Copy-Item -LiteralPath $Path $tmpZip -Force
+	Expand-Archive -LiteralPath $tmpZip -DestinationPath $tmpFolder -Force
 	
 	$slidesDir = Join-Path $tmpFolder "ppt\slides"
 	if (-not (Test-Path -LiteralPath $slidesDir)) {return}
@@ -349,8 +361,8 @@ function Get-ExcelText {
     if (Test-Path -LiteralPath $tmpZip)    { Remove-Item -Force $tmpZip }
 
 	# Unzip the document in temp folder
-	Copy-Item $Path $tmpZip -Force
-	Expand-Archive -Path $tmpZip -DestinationPath $tmpFolder -Force
+	Copy-Item -LiteralPath $Path $tmpZip -Force
+	Expand-Archive -LiteralPath $tmpZip -DestinationPath $tmpFolder -Force
 	
 	
 	$excelTexts = @{}
@@ -358,7 +370,7 @@ function Get-ExcelText {
 	# 1) sharedStrings.xml
 	$sharedStrings = Join-Path $tmpFolder "xl\sharedStrings.xml"
 	if (-not (Test-Path -LiteralPath $sharedStrings)) {
-		Write-Warning "xl\sharedStrings.xml not found in $Path"
+		# Write-Warning "xl\sharedStrings.xml not found in $Path"
 		return
 	}
 	[xml]$ssXml = [xml]$ssXml = Get-Content -LiteralPath $sharedStrings -Raw -Encoding UTF8
@@ -522,7 +534,7 @@ if ($contentScan) {
 			
 			Write-Host "***"
 		}
-	}
+	} else {Write-Host "***   No Keywords found in the scanned files.`n***`n***"}
 	
 	
 }
