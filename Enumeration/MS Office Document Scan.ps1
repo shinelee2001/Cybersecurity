@@ -19,8 +19,8 @@ function Get-DocxText {
     if (Test-Path -LiteralPath $tmpZip) { Remove-Item -Force $tmpZip }
 	
 	# Unzip the document in temp folder
-	Copy-Item $Path $tmpZip
-	Expand-Archive -Path $tmpZip -DestinationPath $tmpFolder -Force
+	Copy-Item -LiteralPath $Path $tmpZip
+	Expand-Archive -LiteralPath $tmpZip -DestinationPath $tmpFolder -Force
 	
 	
 	# (2025-11-05) Scanning logic fix for docx
@@ -65,8 +65,8 @@ function Get-PptxSlidesText {
     if (Test-Path -LiteralPath $tmpZip)    { Remove-Item -Force $tmpZip }
 
 	# Unzip the document in temp folder
-	Copy-Item $Path $tmpZip -Force
-	Expand-Archive -Path $tmpZip -DestinationPath $tmpFolder -Force
+	Copy-Item -LiteralPath $Path $tmpZip -Force
+	Expand-Archive -LiteralPath $tmpZip -DestinationPath $tmpFolder -Force
 	
 	$slidesDir = Join-Path $tmpFolder "ppt\slides"
 	if (-not (Test-Path -LiteralPath $slidesDir)) {return}
@@ -109,8 +109,8 @@ function Get-ExcelText {
     if (Test-Path -LiteralPath $tmpZip)    { Remove-Item -Force $tmpZip }
 
 	# Unzip the document in temp folder
-	Copy-Item $Path $tmpZip -Force
-	Expand-Archive -Path $tmpZip -DestinationPath $tmpFolder -Force
+	Copy-Item -LiteralPath $Path $tmpZip -Force
+	Expand-Archive -LiteralPath $tmpZip -DestinationPath $tmpFolder -Force
 	
 	
 	$excelTexts = @{}
