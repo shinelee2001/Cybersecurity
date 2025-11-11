@@ -1,0 +1,8 @@
+Flags	Name	Meaning
+-------------------------------------------------------------------
+S		SYN		Request start session
+A		ACK		Ack. request
+F		FIN		Request stop session
+R		RST		Reset (abnormal stop)
+P		PSH		Request immediate data transfer (no buffer)
+U		URG		Emergent data exists
