@@ -139,7 +139,7 @@ Write-Host  "`n***   Scanning Recycle Bin..."
 ### Scan Additional Partitions & USB Drives ###
 # Get all non-C: drives, exclude USB (DriveType = 2)
 $nonUSBDrives = Get-CimInstance Win32_LogicalDisk | Where-Object {
-    $_.DeviceID -ne 'C:' -and $_.DriveType -notin 2
+    $_.DeviceID -ne 'C:' -and $_.DriveType -ne 2
 }
 
 # Get corresponding PowerShell drives (PSDrive) for safe access
@@ -167,6 +167,18 @@ function Test-DriveReadable {
 	catch {return [PSCustomObject]@{Readable=$false; Reason=$_.Exception.Message}}
 }
 
+# (2025-11-05) Define FriendlyName of DriveType
+$driveTypeNames = @{
+    0 = 'Unknown'
+    1 = 'No Root Directory'
+    2 = 'Removable'
+    3 = 'Local Disk'
+    4 = 'Network'
+    5 = 'CD-ROM'
+    6 = 'RAM Disk'
+}
+
+
 if ($extraDrives) {
     Write-Host  "`n************************************************************"
     Write-Host  "***`n***   Scanning additional partitions and external drives..."
@@ -184,7 +196,11 @@ if ($extraDrives) {
 		# (2025-11-05) Minor fixes
 		# 	- Improving error handling cases
 		if (-not $probe.Readable) {
-			Write-Host ("***   Skipped while scanning drive $driveLetter. Reason: $probe.Reason")
+			$deviceID = $driveLetter.Trim('\')
+			try {$disk = Get-CimInstance Win32_LogicalDisk | Where-Object {$_.DeviceID -eq $deviceID}}
+			catch {$disk = $null}
+			if ($disk -ne $null) {write-host "***   DriveType: $($driveTypeNames[[int]$disk.DriveType])"} else {write-host "***   DriveType: Unknown"}
+			Write-Host ("***   Skipped while scanning drive {0}(DiskType: {1}). Reason: {2}" -f $driveLetter, $disk, $probe.Reason)
 		}
 		
 		
