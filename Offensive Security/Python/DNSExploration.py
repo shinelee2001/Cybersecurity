@@ -15,7 +15,7 @@ def DNSRequest(domain):
         if result:
             print(domain)
             for answer in result:
-                print(answer)
+                print(answer) # Reverse look up
                 print("Domain Names: %s" % ReverseDNS(answer.to_text()))
     except (dns.resolver.NXDOMAIN, dns.exception.Timeout):
         return
