@@ -2,71 +2,71 @@
 
 param(
   [Parameter(Mandatory=$true)][string] $PlainFile,
-  [string] $OutEncFile = ""
+  [string] $OutPakFile = ""
 )
 
+$ErrorActionPreference = 'Stop'
 
-if (-not (Test-Path $PlainFile)) { Write-Error "PlainFile not found: $PlainFile"; exit 1 }
-if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) { Write-Error "openssl not found in PATH"; exit 2 }
+if (-not (Test-Path $PlainFile)) { Write-Error "PlainFile not found: $PlainFile" }
+if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) { Write-Error "openssl not found in PATH" }
 
-if ($OutEncFile -eq "") { $OutEncFile = "$PlainFile.enc" }
+if ($OutPakFile -eq "") { $OutPakFile = "$PlainFile.pak" }
+if ([IO.Path]::GetExtension($OutPakFile) -ieq ".enc") { $OutPakFile = [IO.Path]::ChangeExtension($OutPakFile, ".pak") }
 
+# --- util
+function New-RandBytes([int]$len){$b = New-Object byte[] $len; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); return $b}
+function ToHex([byte[]]$bytes){ ($bytes | ForEach-Object { $_.ToString("x2") }) -join "" }
+function Sha256([byte[]]$bytes){ $h=[Security.Cryptography.SHA256]::Create(); $h.ComputeHash($bytes) }
 
-# Master key (32 bytes random, base64)
-$bytes = New-Object 'Byte[]' 32
-[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-$masterB64 = [Convert]::ToBase64String($bytes)
+# MasterKey gen
+$master = New-RandBytes 32
+$masterB64 = [Convert]::ToBase64String($master)
 
-# Save the master key
-$keyFile = Join-Path $env:TEMP ("enc_key_{0}.txt" -f ([guid]::NewGuid()))
-[System.IO.File]::WriteAllText($keyFile, $masterB64)
+$KeyOutB64File = Join-Path $env:TEMP ("enc_key_{0}.txt" -f ([guid]::NewGuid()))
+[IO.File]::WriteAllText($KeyOutB64File, $masterB64)
+Write-Host "Master key (base64) written to: $KeyOutB64File"
 
-# Derive EncKey, MacKey from MasterKey
-function Get-BytesFromB64($b64){[Convert]::FromBase64String($b64)}
-function Sha256($bytes){$h = [System.Security.Cryptography.SHA256]::Create(); return $h.ComputeHash($bytes)}
+# EncKye and MacKey gen
+$encKey = Sha256($master + [Text.Encoding]::ASCII.GetBytes("ENC"))
+$macKey = Sha256($master + [Text.Encoding]::ASCII.GetBytes("MAC"))
+$iv     = New-RandBytes 16
 
-$masterBytes = Get-BytesFromB64 $masterB64
-$encKey = Sha256($masterBytes + [Text.Encoding]::ASCII.GetBytes("ENC")) # 32 bytes
-$macKey = Sha256($masterBytes +[Text.Encoding]::ASCII.GetBytes("MAC") )
-
-# AES-256-CBC encryption with IV (no salt, no pbkdf2)
-$iv = New-Object 'Byte[]' 16
-[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($iv)
-
-function ToHex($bytes){ ($bytes|ForEach-Object{$_.ToString("x2")}) -join "" }
+# Encrypt in CBC mdoe
+$ctTemp = [IO.Path]::GetTempFileName()
+Remove-Item $ctTemp -Force
+$ctTemp = "$ctTemp.bin"
 
 $encKeyHex = ToHex $encKey
-$ivHex = ToHex $iv
+$ivHex     = ToHex $iv
 
-$opensslArgs = @(
-  "enc","-aes-256-cbc",
-  "-K", $encKeyHex,
-  "-iv", $ivHex,
-  "-in", $PlainFile,
-  "-out", $OutEncFile
-)
-
+$opensslArgs = @("enc","-aes-256-cbc","-K",$encKeyHex,"-iv",$ivHex,"-in",$PlainFile,"-out",$ctTemp)
 Write-Host "Running: openssl $($opensslArgs -join ' ')"
-& openssl @opensslArgs
-if ($LASTEXITCODE -ne 0) { Write-Error "OpenSSL encryption failed."; exit 3 }
+& openssl @opensslArgs | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "OpenSSL encryption failed." }
 
-# Compute HMAC-SHA256 over (IV || ciphertext)
-$ct = [System.IO.File]::ReadAllBytes($OutEncFile)
+# --- 4) HMAC(IV||CT)
+$ct = [IO.File]::ReadAllBytes($ctTemp)
 $dataToMac = New-Object byte[] ($iv.Length + $ct.Length)
-[Array]::Copy($iv, 0, $dataToMac, 0, $iv.Length)
-[Array]::Copy($ct, 0, $dataToMac, $iv.Length, $ct.Length)
+[Array]::Copy($iv,0,$dataToMac,0,$iv.Length)
+[Array]::Copy($ct,0,$dataToMac,$iv.Length,$ct.Length)
 
-$hmac = [System.Security.Cryptography.HMACSHA256]::new($macKey)
+$hmac = [Security.Cryptography.HMACSHA256]::new($macKey)  # ← 중요: 단일 인자
 $tag  = $hmac.ComputeHash($dataToMac)
 
-$ivFile   = "$OutEncFile.iv"
-$hmacFile = "$OutEncFile.hmac"
-[System.IO.File]::WriteAllBytes($ivFile, $iv)
-[System.IO.File]::WriteAllBytes($hmacFile, $tag)
-Write-Host "Created:"
-Write-Host "  Ciphertext : $OutEncFile"
-Write-Host "  IV         : $ivFile"
-Write-Host "  HMAC       : $hmacFile"
+# Configure .pak file: "PAK1"(4) | 0x01(1) | IV(16) | HMAC(32) | CT(rest)
+$fs = [IO.File]::Open($OutPakFile,[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::None)
+try {
+  $bw = New-Object IO.BinaryWriter($fs)
+  $bw.Write([Text.Encoding]::ASCII.GetBytes("PAK1"))
+  $bw.Write([byte]1)
+  $bw.Write($iv)
+  $bw.Write($tag)
+  $bw.Write($ct)
+  $bw.Flush()
+}
+finally { $fs.Dispose() }
 
+Remove-Item $ctTemp -Force
 
-Write-Host "Encryption complete. Encrypted file: $OutEncFile"
+Write-Host "Encryption Completed.`nCreated PAK: $OutPakFile"
+Write-Host "Share the base64 key via a separate secure channel: $KeyOutB64File"
