@@ -44,13 +44,13 @@ Write-Host "Running: openssl $($opensslArgs -join ' ')"
 & openssl @opensslArgs | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "OpenSSL encryption failed." }
 
-# --- 4) HMAC(IV||CT)
+# HMAC(IV||CT)
 $ct = [IO.File]::ReadAllBytes($ctTemp)
 $dataToMac = New-Object byte[] ($iv.Length + $ct.Length)
 [Array]::Copy($iv,0,$dataToMac,0,$iv.Length)
 [Array]::Copy($ct,0,$dataToMac,$iv.Length,$ct.Length)
 
-$hmac = [Security.Cryptography.HMACSHA256]::new($macKey)  # ← 중요: 단일 인자
+$hmac = [Security.Cryptography.HMACSHA256]::new($macKey)
 $tag  = $hmac.ComputeHash($dataToMac)
 
 # Configure .pak file: "PAK1"(4) | 0x01(1) | IV(16) | HMAC(32) | CT(rest)
