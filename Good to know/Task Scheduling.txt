@@ -1,0 +1,7 @@
+Windows
+- Schduled Task
+
+Linux
+- Launchd
+- Cron
+- Systemd Timers
