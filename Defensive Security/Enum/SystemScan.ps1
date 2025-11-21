@@ -232,6 +232,7 @@ if ($extraDrives) {
 
 # Print results
 if ($foundFiles.Count -gt 0) {
+	Write-Host  "`n************************************************************"
     Write-Host "***`n***   Total files found: $totalFiles" # 2025-07-16
     Write-Host "***`n***   Directories Containing Data Files:"
     foreach ($dir in $foundFiles.Keys) {
