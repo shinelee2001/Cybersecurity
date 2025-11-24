@@ -22,7 +22,8 @@
 # Owen Tan    2025-07-16	Release 9
 # Dongchan Lee 2025-10-23	Minor fixes and improvements e.g. skipping cloud-only entities
 # Dongchan Lee 2025-10-31	Release 10.1 (Introducing content scanning)
-# Dongchan Lee 2025-11-05	Release 10.2 (minor fixes and improvements)
+# Dongchan Lee 2025-11-05	Release 10.2 (Minor fixes and improvements e.g. filename scanning error handling) 
+# Dongchan Lee 2025-11-24	Release 10.3 (Scanning removable disks except NSE Security Scanning drive + minor fixes on content scanning)
  
 # Get system details
 
@@ -54,8 +55,7 @@ Write-Host  "***   Serial Number  : $SerialNumber"
 Write-Host  "***   Windows Version: $windowsVersion"
 Write-Host  "***   Username       : $username    "
 Write-Host  "***`n************************************************************`n***"
-Write-Host "***   " -NoNewline
-Write-Host "Scanning for files and directories containing data, modified or created in the last $days days..." -ForegroundColor Yellow
+Write-Host "***   Scanning for files and directories containing data, modified or created in the last $days days..." -ForegroundColor Yellow
 Write-Host  "***`n************************************************************"
 
 # Record start time
@@ -137,10 +137,11 @@ Write-Host  "`n***   Scanning Recycle Bin..."
 }
 
 ### Scan Additional Partitions & USB Drives ###
-# Get all non-C: drives, exclude USB (DriveType = 2)
-$nonUSBDrives = Get-CimInstance Win32_LogicalDisk | Where-Object {
-    $_.DeviceID -ne 'C:' -and $_.DriveType -ne 2
-}
+# Get all non-C: drives
+# (2025-11-24) Scanning all removable drives
+#	- Removed '-and $_.DriveType -ne 2' condition
+# 	- NSE Security Scanning drive will not be scanned by Test-DriveReadable function
+$nonUSBDrives = Get-CimInstance Win32_LogicalDisk | Where-Object { $_.DeviceID -ne 'C:'}
 
 # Get corresponding PowerShell drives (PSDrive) for safe access
 $extraDrives = @()
@@ -159,7 +160,16 @@ function Test-DriveReadable {
 	
 	if (-not (Test-Path -LiteralPath $driveRoot)) {return [PSCustomObject]@{Readable=$false; Reason='NotFound'}}
 	try {
+		# Skip if drive is not readable
 		&{Get-ChildItem -LiteralPath $driveRoot -Force -Depth 0 -ErrorAction Stop | Out-Null} 2>$null
+
+		# Skip if drive has 'NSE_Scripts' Directory (2025-11-24)
+		$dir = Join-Path $driveRoot 'NSE_Scripts'
+		if (Test-Path -LiteralPath $dir) {
+			return [PSCustomObject]@{Readable=$false; Reason='NSE Security Team Inspection Drive... Skipping Scanning.'}
+		}
+		
+		
 		return [PSCustomObject]@{Readable=$true; Reason=$null}
 	}
 	catch [System.UnauthorizedAccessException] {return [PSCustomObject]@{Readable=$false; Reason='AccessDenied'}}
@@ -180,7 +190,7 @@ $driveTypeNames = @{
 
 
 if ($extraDrives) {
-    Write-Host  "`n************************************************************"
+    Write-Host  "`***`n************************************************************"
     Write-Host  "***`n***   Scanning additional partitions and external drives..."
 
     foreach ($drive in $extraDrives) {
@@ -200,7 +210,8 @@ if ($extraDrives) {
 			try {$disk = Get-CimInstance Win32_LogicalDisk | Where-Object {$_.DeviceID -eq $deviceID}}
 			catch {$disk = $null}
 			if ($disk -ne $null) {write-host "***   DriveType: $($driveTypeNames[[int]$disk.DriveType])"} else {write-host "***   DriveType: Unknown"}
-			Write-Host ("***   Skipped while scanning drive {0}(DiskType: {1}). Reason: {2}" -f $driveLetter, $disk, $probe.Reason)
+			Write-Host ("***   Skipped while scanning. Reason: {0}" -f $probe.Reason)
+			continue
 		}
 		
 		
@@ -232,7 +243,7 @@ if ($extraDrives) {
 
 # Print results
 if ($foundFiles.Count -gt 0) {
-	Write-Host  "`n************************************************************"
+	Write-Host  "`***`n************************************************************"
     Write-Host "***`n***   Total files found: $totalFiles" # 2025-07-16
     Write-Host "***`n***   Directories Containing Data Files:"
     foreach ($dir in $foundFiles.Keys) {
@@ -246,8 +257,8 @@ if ($foundFiles.Count -gt 0) {
         }
     }
 } else {
-    Write-Host "`n************************************************************"
-    Write-Host "`n***   No relevant files found in user directories, Recycle Bin, or other partitions."
+    Write-Host "***`n************************************************************"
+    Write-Host "***`n***   No relevant files found in user directories, Recycle Bin, or other partitions."
 }
 
 
@@ -258,10 +269,12 @@ if ($foundFiles.Count -gt 0) {
 #	Initially added date: 2025-10-31
 #   The compatibility test was only carried out under Powershell v5.1.26100 and .Net Framework 4.8
 #
-
+#	(2025-11-24) Try-catch error handling for tag mismatching error found during xml file read.
+# 		- This error was occasionally found when documents contain Koreans or Chinese. (e.g., <w:t>涓€鑷存€ч噸澶嶆€?/w:t>)
+#		- I don't know if byte reading first then UTF-8 encoding would help the case. (If you think it is reasonable, then change it please with justification)
 
 # Define keywords to look up in documents
-$defaultKeywords = @('confidential', 'nextstar energy', 'nse ')
+$defaultKeywords = @('confidential', 'nextstar energy', 'nse ', 'esst')
 if ($keywords) { $defaultKeywords += $keywords }
 
 
@@ -302,7 +315,13 @@ function Get-DocxText {
 	$docxTexts = @{}
 	
 	foreach($docxFile in $fileNames){
-		[xml]$xml = Get-Content -LiteralPath $docxFile -Raw
+		try {
+			[xml]$xml = Get-Content -LiteralPath $docxFile -Raw -Encoding UTF8
+		}
+		catch {
+			$docxTexts[($docxFile -split '\\')[-1]] = "[XML Parse failed] $($_.Exception.Message)"
+			continue
+		}
 		
 		$textNodes = $xml.SelectNodes('//*[local-name()="t"]')
         $text = ($textNodes | ForEach-Object { $_.InnerText }) -join ' '
@@ -345,9 +364,15 @@ function Get-PptxSlidesText {
 	
 	
 	foreach($sf in $slideFiles) {
-		[xml]$xml = Get-Content $sf.FullName -Raw
+		try {
+			[xml]$xml = Get-Content $sf.FullName -Raw -Encoding UTF8
+		}
+		catch {
+			$slideTexts[$sf.Name] = "[XML Parse failed] $($_.Exception.Message)"
+			continue
+		}
 		
-		$tNodes = $xml.SelectNodes('//*[local-name()="t" and namespace-uri()="http://schemas.openxmlformats.org/drawingml/2006/main"]')
+		$tNodes = $xml.SelectNodes('//*[local-name()="t"')
 		
 		$text = ($tNodes | ForEach-Object { $_.InnerText }) -join ' '
 		$lines = $text -split '\. '
@@ -390,7 +415,12 @@ function Get-ExcelText {
 		# Write-Warning "xl\sharedStrings.xml not found in $Path"
 		return
 	}
-	[xml]$ssXml = [xml]$ssXml = Get-Content -LiteralPath $sharedStrings -Raw -Encoding UTF8
+	try {
+		[xml]$ssXml = Get-Content -LiteralPath $sharedStrings -Raw -Encoding UTF8
+	}
+	catch {
+		$excelTexts["sharedStrings.xml"] = "[XML Parse failed] $($_.Exception.Message)"
+	}
 	$ssTNodes = $ssXml.SelectNodes('//*[local-name()="t"]')
 	$ssText = ($ssTNodes | ForEach-Object { $_.InnerText }) -join ' '
 	$ssLines = $ssText -split '\. '
@@ -407,8 +437,13 @@ function Get-ExcelText {
 	$drawingFiles = Get-ChildItem -LiteralPath $drawingDir -Filter "drawing*.xml" -File
 	
 	foreach($df in $drawingFiles) {
-		[xml]$xml = Get-Content $df.FullName -Raw -Encoding UTF8
-		
+		try {
+			[xml]$xml = Get-Content $df.FullName -Raw -Encoding UTF8
+		}
+		catch {
+			$excelTexts[$df.Name] = "[XML Parse failed] $($_.Exception.Message)"
+			continue
+		}
 		$tNodes = $xml.SelectNodes('//*[local-name()="t"]')
 		
 		$text = ($tNodes | ForEach-Object { $_.InnerText }) -join ' '
@@ -425,16 +460,15 @@ function Get-ExcelText {
 	
 	$chartFiles = Get-ChildItem -LiteralPath $chartDir -Filter "chart*.xml" -File
 	foreach($cf in $chartFiles) {
-		[xml]$xml = Get-Content $cf.FullName -Raw -Encoding UTF8
+		try {
+			[xml]$xml = Get-Content $cf.FullName -Raw -Encoding UTF8	
+		}
+		catch {
+			excelTexts[$cf.Name] = "[XML Parse failed] $($_.Exception.Message)"
+			continue
+		}
 		
-		$paths = @(
-			'//*[local-name()="t" and namespace-uri()="http://schemas.openxmlformats.org/drawingml/2006/main"]',
-            '//*[local-name()="v" and namespace-uri()="http://schemas.openxmlformats.org/drawingml/2006/chart"]',
-            '//*[local-name()="tx"]//*[local-name()="t"]',
-            '//*[local-name()="rich"]//*[local-name()="t"]',
-            '//*[local-name()="title"]//*[local-name()="t"]',
-            '//*[local-name()="legend"]//*[local-name()="t"]'
-		)
+		$paths = @('//*[local-name()="t"]', '//*[local-name()="v"]')
 		foreach ($path in $paths) {
 			$nodes = $xml.SelectNodes($path)
 			if ($nodes) {
@@ -462,8 +496,7 @@ function Get-ExcelText {
 if ($contentScan) {
 	
 	Write-Host "***`n************************************************************`n***"
-	Write-Host "***   " -NoNewline
-	Write-Host "Scanning file contents..." -ForegroundColor Yellow
+	Write-Host "***   Scanning file contents..." -ForegroundColor Yellow
 	Write-Host "***`n***   Keywords are: $(($defaultKeywords | ForEach-Object { $_ } ) -join ',')"
 	Write-Host "***`n************************************************************"
 	Write-Host "***"
@@ -568,8 +601,7 @@ if ($contentScan) {
 #
 
 Write-Host "***`n************************************************************`n***"
-Write-Host "***   " -NoNewline
-Write-Host "Scanning traits of external storage in the last $days days..." -ForegroundColor Yellow
+Write-Host "***   Scanning traits of external storage in the last $days days..." -ForegroundColor Yellow
 Write-Host "***`n************************************************************"
 Write-Host "***"
 
@@ -714,5 +746,5 @@ if (Test-Path $logFile) {
 		Write-Host "$($_.Exception.Message)" -ForegroundColor Red
 	}
 } else {
-	Write-Host "Cannot find the log file."
+Write-Host "Cannot find the log file."
 }
