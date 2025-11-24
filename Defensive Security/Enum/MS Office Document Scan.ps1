@@ -33,7 +33,13 @@ function Get-DocxText {
 	$docxTexts = @{}
 	
 	foreach($docxFile in $fileNames){
-		[xml]$xml = Get-Content -LiteralPath $docxFile -Raw
+		try {
+			[xml]$xml = Get-Content -LiteralPath $docxFile -Raw -Encoding UTF8
+		}
+		catch {
+			$docxTexts[($docxFile -split '\\')[-1]] = "[XML Parse failed] $($_.Exception.Message)"
+			continue
+		}
 		
 		$textNodes = $xml.SelectNodes('//*[local-name()="t"]')
         $text = ($textNodes | ForEach-Object { $_.InnerText }) -join ' '
@@ -76,9 +82,15 @@ function Get-PptxSlidesText {
 	
 	
 	foreach($sf in $slideFiles) {
-		[xml]$xml = Get-Content $sf.FullName -Raw
+		try {
+			[xml]$xml = Get-Content $sf.FullName -Raw -Encoding UTF8
+		}
+		catch {
+			$slideTexts[$sf.Name] = "[XML Parse failed] $($_.Exception.Message)"
+			continue
+		}
 		
-		$tNodes = $xml.SelectNodes('//*[local-name()="t" and namespace-uri()="http://schemas.openxmlformats.org/drawingml/2006/main"]')
+		$tNodes = $xml.SelectNodes('//*[local-name()="t"')
 		
 		$text = ($tNodes | ForEach-Object { $_.InnerText }) -join ' '
 		$lines = $text -split '\. '
@@ -121,7 +133,12 @@ function Get-ExcelText {
 		# Write-Warning "xl\sharedStrings.xml not found in $Path"
 		return
 	}
-	[xml]$ssXml = [xml]$ssXml = Get-Content -LiteralPath $sharedStrings -Raw -Encoding UTF8
+	try {
+		[xml]$ssXml = Get-Content -LiteralPath $sharedStrings -Raw -Encoding UTF8
+	}
+	catch {
+		$excelTexts["sharedStrings.xml"] = "[XML Parse failed] $($_.Exception.Message)"
+	}
 	$ssTNodes = $ssXml.SelectNodes('//*[local-name()="t"]')
 	$ssText = ($ssTNodes | ForEach-Object { $_.InnerText }) -join ' '
 	$ssLines = $ssText -split '\. '
@@ -138,8 +155,13 @@ function Get-ExcelText {
 	$drawingFiles = Get-ChildItem -LiteralPath $drawingDir -Filter "drawing*.xml" -File
 	
 	foreach($df in $drawingFiles) {
-		[xml]$xml = Get-Content $df.FullName -Raw -Encoding UTF8
-		
+		try {
+			[xml]$xml = Get-Content $df.FullName -Raw -Encoding UTF8
+		}
+		catch {
+			$excelTexts[$df.Name] = "[XML Parse failed] $($_.Exception.Message)"
+			continue
+		}
 		$tNodes = $xml.SelectNodes('//*[local-name()="t"]')
 		
 		$text = ($tNodes | ForEach-Object { $_.InnerText }) -join ' '
@@ -156,16 +178,15 @@ function Get-ExcelText {
 	
 	$chartFiles = Get-ChildItem -LiteralPath $chartDir -Filter "chart*.xml" -File
 	foreach($cf in $chartFiles) {
-		[xml]$xml = Get-Content $cf.FullName -Raw -Encoding UTF8
+		try {
+			[xml]$xml = Get-Content $cf.FullName -Raw -Encoding UTF8	
+		}
+		catch {
+			excelTexts[$cf.Name] = "[XML Parse failed] $($_.Exception.Message)"
+			continue
+		}
 		
-		$paths = @(
-			'//*[local-name()="t" and namespace-uri()="http://schemas.openxmlformats.org/drawingml/2006/main"]',
-            '//*[local-name()="v" and namespace-uri()="http://schemas.openxmlformats.org/drawingml/2006/chart"]',
-            '//*[local-name()="tx"]//*[local-name()="t"]',
-            '//*[local-name()="rich"]//*[local-name()="t"]',
-            '//*[local-name()="title"]//*[local-name()="t"]',
-            '//*[local-name()="legend"]//*[local-name()="t"]'
-		)
+		$paths = @('//*[local-name()="t"]', '//*[local-name()="v"]')
 		foreach ($path in $paths) {
 			$nodes = $xml.SelectNodes($path)
 			if ($nodes) {
@@ -186,4 +207,102 @@ function Get-ExcelText {
     Remove-Item -Force $tmpZip
 	
 	return $excelTexts
+}
+
+
+# Content scanning runs only if the script runs with -contentScan argument
+if ($contentScan) {
+	
+	Write-Host "***`n************************************************************`n***"
+	Write-Host "***   Scanning file contents..." -ForegroundColor Yellow
+	Write-Host "***`n***   Keywords are: $(($defaultKeywords | ForEach-Object { $_ } ) -join ',')"
+	Write-Host "***`n************************************************************"
+	Write-Host "***"
+	
+	foreach ($dir in $foundFiles.Keys) {
+		foreach ($file in $foundFiles[$dir]) {
+			$fileFullName = $file.FullName
+			$ext = $fileFullName.Split('.')[-1]
+			
+			# scan txt files
+			if ($ext -eq 'txt') {
+				$keywordFound = Select-String -Path $fileFullName -Pattern $keywordPtn -SimpleMatch -ErrorAction SilentlyContinue
+				
+				if ($keywordFound) {
+					$matches = Select-String -Path $fileFullName -Pattern $keywordPtn -SimpleMatch -ErrorAction SilentlyContinue
+					$matchedLines = @()
+					
+					foreach ($m in $matches) {
+						$matchedLines += ("[Line $($m.LineNumber)] $($m.Line)")
+					}
+					
+					$obj = New-Object PSObject -Property @{
+						Name = $fileFullName
+						MatchedLines = $matchedLines -join "`n***      "
+					}
+					
+					$keywordFoundFiles.Add($obj)
+				}		
+			}
+			
+			# scan docx files
+			if ($ext -eq 'docx') {
+				$keywordFound = Get-DocxText $fileFullName
+				if ($keywordFound.Count -gt 0) {
+					$obj = New-Object PSObject -Property @{
+						Name = $fileFullName
+						MatchedLines = $keywordFound
+					}
+					$keywordFoundFiles.Add($obj)
+				}
+			}
+			
+			# scan pptx files
+			if ($ext -eq 'pptx') {
+				$keywordFound = Get-PptxSlidesText $fileFullName
+				if ($keywordFound.Count -gt 0) {
+					$obj = New-Object PSObject -Property @{
+						Name = $fileFullName
+						MatchedLines = $keywordFound
+					}
+					$keywordFoundFiles.Add($obj)
+				}
+			}
+			
+			# scan xlsx files
+			if ($ext -eq 'xlsx') {
+				$keywordFound = Get-ExcelText $fileFullName
+				if ($keywordFound.Count -gt 0) {
+					$obj = New-Object PSObject -Property @{
+						Name = $fileFullName
+						MatchedLines = $keywordFound
+					}
+					$keywordFoundFiles.Add($obj)
+				}
+			}
+			
+			
+		}
+	}
+	
+
+	# Print content scanning result
+	if ($keywordFoundFiles.Count -gt 0) {
+		Write-Host "***   Keyword(s) found in the following files:`n"
+		foreach($f in $keywordFoundFiles) {
+			Write-Host "***   [File]: $($f.Name)"
+			
+			if ($f.MatchedLines -is [Hashtable]) {
+				$f.MatchedLines.GetEnumerator() | Sort-Object Key | ForEach-Object {
+					Write-Host ("***      [{0}] {1}" -f $_.Key, $_.Value)
+				}
+			} else {
+				Write-Host "***      $($f.MatchedLines)"
+			}
+			
+			Write-Host "***"
+		}
+	} else {Write-Host "***   No Keywords found in the scanned files.`n***`n***"}
+	
+	
 }
