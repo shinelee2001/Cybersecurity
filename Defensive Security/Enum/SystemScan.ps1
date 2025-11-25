@@ -23,7 +23,7 @@
 # Dongchan Lee 2025-10-23	Minor fixes and improvements e.g. skipping cloud-only entities
 # Dongchan Lee 2025-10-31	Release 10.1 (Introducing content scanning)
 # Dongchan Lee 2025-11-05	Release 10.2 (Minor fixes and improvements e.g. filename scanning error handling) 
-# Dongchan Lee 2025-11-24	Release 10.3 (Scanning removable disks except NSE Security Scanning drive + minor fixes on content scanning)
+# Dongchan Lee 2025-11-24	Release 10.3 (Scanning removable disks except NSE Security Scanning drive + Windows built-in OCR engine integration for content scan + minor fixes on content scanning)
  
 # Get system details
 
@@ -272,9 +272,10 @@ if ($foundFiles.Count -gt 0) {
 #	(2025-11-24) Try-catch error handling for tag mismatching error found during xml file read.
 # 		- This error was occasionally found when documents contain Koreans or Chinese. (e.g., <w:t>涓€鑷存€ч噸澶嶆€?/w:t>)
 #		- I don't know if byte reading first then UTF-8 encoding would help the case. (If you think it is reasonable, then change it please with justification)
+#
 
 # Define keywords to look up in documents
-$defaultKeywords = @('confidential', 'nextstar energy', 'nse ', 'esst')
+$defaultKeywords = @('confidential', 'secret', 'nextstar energy', 'nse ', 'esst')
 if ($keywords) { $defaultKeywords += $keywords }
 
 
@@ -491,6 +492,222 @@ function Get-ExcelText {
 	return $excelTexts
 }
 
+# (2025-11-24) OCR Scan
+#
+# Compatible PSEditions: Desktop
+# Powershell version: 5
+# OS Version: Windows 10 or above (It uses Windows built-in OCR engine)
+# Reference: https://github.com/TobiasPSP/PsOcr
+#
+
+$script:OcrInitialized = $false
+$script:OcrAwaiter        = $null   # For IAsyncOperation<T>
+$script:OcrActionAwaiter  = $null   # For IAsyncAction
+
+# Load OCR in WinRT
+function Initialize-OcrWinRT{
+    if ($script:OcrInitialized) { return }
+
+    try {
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime
+
+        # Load WinRT types as required
+        $null = [Windows.Storage.StorageFile,                Windows.Storage,         ContentType = WindowsRuntime]
+        $null = [Windows.Media.Ocr.OcrEngine,                Windows.Foundation,      ContentType = WindowsRuntime]
+        $null = [Windows.Foundation.IAsyncOperation`1,       Windows.Foundation,      ContentType = WindowsRuntime]
+        $null = [Windows.Foundation.IAsyncAction,            Windows.Foundation,      ContentType = WindowsRuntime]
+        $null = [Windows.Graphics.Imaging.SoftwareBitmap,    Windows.Foundation,      ContentType = WindowsRuntime]
+        $null = [Windows.Storage.Streams.RandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
+        $null = [Windows.Data.Pdf.PdfDocument,               Windows.Data.Pdf,        ContentType = WindowsRuntime]
+        $null = [WindowsRuntimeSystemExtensions]
+        $null = [Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages
+
+        # 1) IAsyncOperation<T> awaiter
+        $script:OcrAwaiter = [WindowsRuntimeSystemExtensions].GetMember(
+            'GetAwaiter', 'Method', 'Public,Static'
+        ) | Where-Object {
+            $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+        } | Select-Object -First 1
+
+        # 2) IAsyncAction awaiter
+        $script:OcrActionAwaiter = [WindowsRuntimeSystemExtensions].GetMember(
+            'GetAwaiter', 'Method', 'Public,Static'
+        ) | Where-Object {
+            $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction'
+        } | Select-Object -First 1
+
+        if (-not $script:OcrAwaiter -or -not $script:OcrActionAwaiter) {
+            throw "Failed to locate WinRT awaiter methods."
+        }
+
+        # IAsyncOperation<T>
+        if (-not (Get-Command Invoke-WinRtAsync -ErrorAction SilentlyContinue)) {
+            function Script:Invoke-WinRtAsync {
+                param(
+                    [Parameter(Mandatory)][object]$AsyncTask,
+                    [Parameter(Mandatory)][Type]$As
+                )
+
+                return $script:OcrAwaiter.
+                    MakeGenericMethod($As).
+                    Invoke($null, @($AsyncTask)).
+                    GetResult()
+            }
+        }
+
+        # IAsyncAction
+        if (-not (Get-Command Invoke-WinRtAction -ErrorAction SilentlyContinue)) {
+            function Script:Invoke-WinRtAction {
+                param(
+                    [Parameter(Mandatory)][object]$AsyncTask
+                )
+
+                # GetResult() would be void, but we only just have to wait
+                return $script:OcrActionAwaiter.
+                    Invoke($null, @($AsyncTask)).
+                    GetResult()
+            }
+        }
+
+        $script:OcrInitialized = $true
+    }
+    catch {
+        throw '***   OCR requires Windows 10 or above and PowerShell .'
+    }
+}
+
+
+# Read images and find keywords
+function Get-ImageOcrMatches {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$KeywordPattern,
+        [string]$LanguageTag = 'en-US' # Currently I have fixed 'en-US' now since KeywordPattern has English words only.
+    )
+
+    Initialize-OcrWinRT
+
+    try {
+        if ($LanguageTag) {
+            $lang      = New-Object Windows.Globalization.Language $LanguageTag
+            $ocrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($lang)
+        } else {
+            $ocrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+        }
+        if (-not $ocrEngine) { return $null }
+
+        $fileTask    = [Windows.Storage.StorageFile]::GetFileFromPathAsync($Path)
+        $storageFile = Invoke-WinRtAsync $fileTask ([Windows.Storage.StorageFile])
+
+        $contentTask = $storageFile.OpenAsync([Windows.Storage.FileAccessMode]::Read)
+        $fileStream  = Invoke-WinRtAsync $contentTask ([Windows.Storage.Streams.IRandomAccessStream])
+
+        $decoderTask   = [Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($fileStream)
+        $bitmapDecoder = Invoke-WinRtAsync $decoderTask ([Windows.Graphics.Imaging.BitmapDecoder])
+
+        $bmpTask        = $bitmapDecoder.GetSoftwareBitmapAsync()
+        $softwareBitmap = Invoke-WinRtAsync $bmpTask ([Windows.Graphics.Imaging.SoftwareBitmap])
+
+        $ocrTask   = $ocrEngine.RecognizeAsync($softwareBitmap)
+        $ocrResult = Invoke-WinRtAsync $ocrTask ([Windows.Media.Ocr.OcrResult])
+
+        $lines = @()
+        foreach ($line in $ocrResult.Lines) {
+            $lineText = ($line.Words | ForEach-Object { $_.Text }) -join ' '
+            if ($lineText) { $lines += $lineText }
+        }
+
+        $matched = $lines | Where-Object { $_ -match $KeywordPattern }
+        if ($matched) {
+            return @{ 'OCR' = ($matched -join "`n") }
+        }
+
+        return $null
+    }
+    catch {
+        Write-Host "Image OCR failed for '$Path': $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Read pdf and find keywords
+function Get-PdfOcrMatches {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$KeywordPattern,
+        [string]$LanguageTag = 'en-US' # Currently I have fixed 'en-US' now since KeywordPattern has English words only.
+    )
+
+    Initialize-OcrWinRT
+
+    try {
+        if ($LanguageTag) {
+            $lang      = New-Object Windows.Globalization.Language $LanguageTag
+            $ocrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($lang)
+        } else {
+            $ocrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+        }
+        if (-not $ocrEngine) { return $null }
+
+        $fileTask    = [Windows.Storage.StorageFile]::GetFileFromPathAsync($Path)
+        $storageFile = Invoke-WinRtAsync $fileTask ([Windows.Storage.StorageFile])
+
+        $pdfTask = [Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($storageFile)
+        $pdfDoc  = Invoke-WinRtAsync $pdfTask ([Windows.Data.Pdf.PdfDocument])
+        if (-not $pdfDoc) { return $null }
+
+        $pageMatches = @{}
+        $pageCount   = $pdfDoc.PageCount
+
+        for ($i = 0; $i -lt $pageCount; $i++) {
+            $page = $pdfDoc.GetPage($i)
+            if (-not $page) { continue }
+
+            $stream = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
+
+            # IAsyncAction --> Invoke-WinRtAction
+            $renderAction = $page.RenderToStreamAsync($stream)
+            $null = Invoke-WinRtAction $renderAction
+
+            $decoderTask = [Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)
+            $decoder     = Invoke-WinRtAsync $decoderTask ([Windows.Graphics.Imaging.BitmapDecoder])
+
+            $bmpTask        = $decoder.GetSoftwareBitmapAsync()
+            $softwareBitmap = Invoke-WinRtAsync $bmpTask ([Windows.Graphics.Imaging.SoftwareBitmap])
+
+            $ocrTask   = $ocrEngine.RecognizeAsync($softwareBitmap)
+            $ocrResult = Invoke-WinRtAsync $ocrTask ([Windows.Media.Ocr.OcrResult])
+
+            $lines = @()
+            foreach ($line in $ocrResult.Lines) {
+                $lineText = ($line.Words | ForEach-Object { $_.Text }) -join ' '
+                if ($lineText) { $lines += $lineText }
+            }
+
+            $matched = $lines | Where-Object { $_ -match $KeywordPattern }
+            if ($matched) {
+                $pageKey = "Page $($i + 1)"
+                $pageMatches[$pageKey] = ($matched -join "`n")
+            }
+
+            $page.Dispose()
+            $stream.Dispose()
+        }
+
+        if ($pageMatches.Count -gt 0) { return $pageMatches }
+        return $null
+    }
+    catch {
+        Write-Host "PDF OCR failed for '$Path': $($_.Exception.Message)"
+        return $null
+    }
+}
+
+
+
+
 
 # Content scanning runs only if the script runs with -contentScan argument
 if ($contentScan) {
@@ -563,6 +780,31 @@ if ($contentScan) {
 				}
 			}
 			
+			# scan image files
+			if ($ext -in @('png','jpg','jpeg','jfif','bmp','tif','tiff')) {
+				$keywordFound = Get-ImageOcrMatches -Path $fileFullName -KeywordPattern $keywordPtn
+				if ($keywordFound -and $keywordFound.Count -gt 0) {
+					$obj = New-Object PSObject -Property @{
+						Name         = $fileFullName
+						MatchedLines = $keywordFound   # Hashtable: 'OCR' = lines
+					}
+					$keywordFoundFiles.Add($obj)
+				}
+			}
+			
+			# scan pdf files
+			if ($ext -eq 'pdf') {
+                $keywordFound = Get-PdfOcrMatches -Path $fileFullName -KeywordPattern $keywordPtn
+                if ($keywordFound -and $keywordFound.Count -gt 0) {
+                    $obj = New-Object PSObject -Property @{
+                        Name         = $fileFullName
+                        MatchedLines = $keywordFound
+                    }
+                    $keywordFoundFiles.Add($obj)
+                }
+            }
+			
+			
 			
 		}
 	}
@@ -570,7 +812,7 @@ if ($contentScan) {
 
 	# Print content scanning result
 	if ($keywordFoundFiles.Count -gt 0) {
-		Write-Host "***   Keyword(s) found in the following files:`n"
+		Write-Host "***   Keyword(s) found in the following files:`n***"
 		foreach($f in $keywordFoundFiles) {
 			Write-Host "***   [File]: $($f.Name)"
 			
@@ -614,32 +856,27 @@ if ((Get-WinEvent -ListLog $UMDFLogName).IsEnabled) {
 	Write-Host "***   UMDF event log is currently disabled.`n***"
 }
 
-###
-# Currently disabled to reduce the noise.
-###
-# # Check UMDF records remaining in the system.
-# Write-Host  "***"
-# Write-Host  "***   Total UMDF events found: $((Get-WinEvent -LogName $UMDFLogName).Count)"
-# Write-Host  "***"
-# Write-Host  "***"
-# 
-# if ($UMDFCount -eq 0) {
-# 	Write-Host  "***   No UMDF events recorded in the system."
-# } else {
-# 	
-# 	# Looking for keywords: "finished Pnp or Power operation"
-# 	$UDMFRecords = (Get-WinEvent -FilterHashtable @{LogName=$UMDFLogName; StartTime=$dateThreshold} | 
-# 		Where-Object {($_.Message -match "finished" )} | Select-Object TimeCreated, Message)
-# 	
-# 	foreach ($event in $UDMFRecords) {
-# 		Write-Host ("***   $($event.TimeCreated) - $($event.Message)`n***")
-# 	}
-# }
-# 
-# Write-Host  "***"
-# Write-Host  "***"
-# Write-Host  "***"
-# Write-Host  "***"
+# Check UMDF records remaining in the system.
+if ($UMDFCount -eq 0) {
+	Write-Host  "***`n***   No UMDF events recorded in the system."
+} else {
+	
+	# Looking for keywords: "finished Pnp or Power operation"
+	$UMDFRecords = (Get-WinEvent -FilterHashtable @{LogName=$UMDFLogName; StartTime=$dateThreshold} | 
+		Where-Object {($_.Message -match "finished" )} | Select-Object TimeCreated, Message)
+	
+	Write-Host ("***`n***   Total UMDF events found in the last {0} days: {1}`n***" -f $days, $UMDFRecords.Count)
+	
+	foreach ($event in $UMDFRecords) {
+		$eventMsg = $event.Message -replace 'Forwarded.*?device\s*',''
+		Write-Host ("***   [{0}] - {1}" -f $event.TimeCreated, $eventMsg)
+	}
+}
+
+Write-Host  "***"
+Write-Host  "***"
+Write-Host  "***"
+Write-Host  "***"
 
 # Parse USBSTOR driver-install blocks from setupapi.dev.log
 Write-Host  "***   Extracting USBSTOR logs from setupapi.dev.log..."
@@ -704,7 +941,7 @@ foreach ($b in $blocks) {
 	
 }
 
-Write-Host "***   Total USBSTOR logs found: $($filteredBlocks.Count)"
+Write-Host "***`n***   Total USBSTOR logs found: $($filteredBlocks.Count)"
 Write-Host "***"
 Write-Host "***"
 
@@ -731,7 +968,7 @@ Stop-Transcript
 
 
 
-# Copying the logFile to the directory where the script is located (2025-10-23)
+# # Copying the logFile to the directory where the script is located (2025-10-23)
 $destPath = $PSScriptRoot
 Write-Host "`n"
 if (Test-Path $logFile) {
@@ -746,5 +983,5 @@ if (Test-Path $logFile) {
 		Write-Host "$($_.Exception.Message)" -ForegroundColor Red
 	}
 } else {
-Write-Host "Cannot find the log file."
+	Write-Host "Cannot find the log file."
 }
