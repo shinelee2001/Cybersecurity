@@ -724,7 +724,7 @@ if ($contentScan) {
 			$ext = $fileFullName.Split('.')[-1]
 			
 			# scan txt files
-			if ($ext -eq 'txt')) {
+			if ($ext -eq 'txt') {
 				$keywordFound = Select-String -Path $fileFullName -Pattern $keywordPtn -SimpleMatch -ErrorAction SilentlyContinue
 				
 				if ($keywordFound) {
