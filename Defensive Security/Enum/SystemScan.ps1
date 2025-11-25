@@ -68,7 +68,7 @@ $dateThreshold = (Get-Date).AddDays(-$days)
 $excludedDirs = @("AppData", "Windows", "Program Files", "Program Files (x86)")
 
 # Define data file extensions of interest
-$dataFileExtensions = @(".jpg", ".png", ".mp4", ".mov", ".docx", ".xlsx", ".pptx", ".txt", ".pdf", ".csv", ".zip")
+$dataFileExtensions = @(".jpg", "jpeg", "tif", "tiff",".png", ".mp4", ".mov", ".docx", ".xlsx", ".pptx", ".txt", ".pdf", ".csv", ".zip")
 
 # Initialize storage for found files
 $foundFiles = @{}
@@ -724,7 +724,7 @@ if ($contentScan) {
 			$ext = $fileFullName.Split('.')[-1]
 			
 			# scan txt files
-			if ($ext -eq 'txt') {
+			if ($ext -eq 'txt')) {
 				$keywordFound = Select-String -Path $fileFullName -Pattern $keywordPtn -SimpleMatch -ErrorAction SilentlyContinue
 				
 				if ($keywordFound) {
