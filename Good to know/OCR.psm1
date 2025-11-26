@@ -2,6 +2,7 @@
   Minimal Windows OCR helper
   - Requires: Windows PowerShell 5.1, Windows 10/11
   - Uses Windows.Media.Ocr with user profile languages
+  - Reference: https://github.com/TobiasPSP/PsOcr/blob/main/Modules/PsOcr/1.1.0/root.psm1
 #>
 
 $script:OcrAwaiter    = $null
