@@ -275,7 +275,7 @@ if ($foundFiles.Count -gt 0) {
 #
 
 # Define keywords to look up in documents
-$defaultKeywords = @('confidential', 'secret', 'nextstar energy', 'nse ', 'esst')
+$defaultKeywords = @('confidential', 'secret', 'nextstar energy', 'nse ', 'esst', 'nextstar')
 if ($keywords) { $defaultKeywords += $keywords }
 
 
@@ -373,7 +373,7 @@ function Get-PptxSlidesText {
 			continue
 		}
 		
-		$tNodes = $xml.SelectNodes('//*[local-name()="t"')
+		$tNodes = $xml.SelectNodes('//*[local-name()="t"]')
 		
 		$text = ($tNodes | ForEach-Object { $_.InnerText }) -join ' '
 		$lines = $text -split '\. '
@@ -857,23 +857,32 @@ if ((Get-WinEvent -ListLog $UMDFLogName).IsEnabled) {
 }
 
 # Check UMDF records remaining in the system.
-if ($UMDFCount -eq 0) {
-	Write-Host  "***`n***   No UMDF events recorded in the system."
-} else {
-	
-	# Looking for keywords: "finished Pnp or Power operation"
-	$UMDFRecords = (Get-WinEvent -FilterHashtable @{LogName=$UMDFLogName; StartTime=$dateThreshold} | 
-		Where-Object {($_.Message -match "finished" )} | Select-Object TimeCreated, Message)
-	
-	Write-Host ("***`n***   Total UMDF events found in the last {0} days: {1}`n***" -f $days, $UMDFRecords.Count)
+$Script:HasUMDF = $true
+
+try {
+	# Looking for keyword: 'finished Pnp or Power operation'
+	$UMDFRecords = (Get-WinEvent -FilterHashtable @{LogName=$UMDFLogName; StartTime=$dateThreshold} -ErrorAction Stop| 
+		Where-Object {($_.Message -match "finished")} | Select-Object TimeCreated, Message)
+} catch {
+	if ($_.FullyQualifiedErrorId -match 'NoMatchingEventsFound') {
+		Write-Host "***   No UMDF events found in the last $days days..."
+	} else {
+		Write-Host "***   An error occurred while retrieving events: $_.Exception.Message"
+	}
+	$Script:HasUMDF = $false
+} 
+
+# Print PnP events if they are found
+if ($Script:HasUMDF) {
+	Write-Host ("***`n***   Total UMDF events found in the last {0} days: {1}" -f $days, $UMDFRecords.Count)
 	
 	foreach ($event in $UMDFRecords) {
-		$eventMsg = $event.Message -replace 'Forwarded.*?device\s*',''
-		Write-Host ("***   [{0}] - {1}" -f $event.TimeCreated, $eventMsg)
+		$eventMsg = $event.Message -replace 'Forwarded.*?device\s*', ''
+		Write-Host ("***   [{0}] {1}" -f $event.TimeCreated, $eventMsg)
 	}
 }
 
-Write-Host  "***"
+
 Write-Host  "***"
 Write-Host  "***"
 Write-Host  "***"
@@ -943,7 +952,6 @@ foreach ($b in $blocks) {
 
 Write-Host "***`n***   Total USBSTOR logs found: $($filteredBlocks.Count)"
 Write-Host "***"
-Write-Host "***"
 
 foreach($e in $filteredBlocks) {
 	($e).Replace(">>>", "*** ")
@@ -968,20 +976,20 @@ Stop-Transcript
 
 
 
-# # Copying the logFile to the directory where the script is located (2025-10-23)
-$destPath = $PSScriptRoot
-Write-Host "`n"
-if (Test-Path $logFile) {
-	try {
-		Copy-Item -Path $logFile -Destination $destPath -ErrorAction Stop
-		$logFileName = $logFile.Split('\')[-1]
-		$filePath = Join-Path -Path $destPath -ChildPath $logFileName
-		Write-Host "The file successfully copied to: " -NoNewline
-		Write-Host "$filePath"
-	} catch {
-		Write-Host "Something went wrong while copying the file: " -NoNewline
-		Write-Host "$($_.Exception.Message)" -ForegroundColor Red
-	}
-} else {
-	Write-Host "Cannot find the log file."
-}
+# # # Copying the logFile to the directory where the script is located (2025-10-23)
+# $destPath = $PSScriptRoot
+# Write-Host "`n"
+# if (Test-Path $logFile) {
+# 	try {
+# 		Copy-Item -Path $logFile -Destination $destPath -ErrorAction Stop
+# 		$logFileName = $logFile.Split('\')[-1]
+# 		$filePath = Join-Path -Path $destPath -ChildPath $logFileName
+# 		Write-Host "The file successfully copied to: " -NoNewline
+# 		Write-Host "$filePath"
+# 	} catch {
+# 		Write-Host "Something went wrong while copying the file: " -NoNewline
+# 		Write-Host "$($_.Exception.Message)" -ForegroundColor Red
+# 	}
+# } else {
+# 	Write-Host "Cannot find the log file."
+# }
