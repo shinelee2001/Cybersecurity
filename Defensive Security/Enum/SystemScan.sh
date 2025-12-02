@@ -3,7 +3,7 @@
 # NSE System Scan (Linux bash version)
 #
 # - Scans user home directories and trash for files changed within last N days
-# - Scans external mounts (/media, /mnt, /run/media, /Volumes)
+# - Scans external mounts (/media, /mnt, /run/media)
 # - Optionally scans file contents for sensitive keywords
 #
 # Usage:
@@ -82,7 +82,7 @@ CURRENT_USER=${USER:-$(whoami)}
 
 echo
 echo "************************************************************"
-echo "***   Starting NSE system scan (bash) ..."
+echo "***   Starting NSE system scan (Linux bash) ..."
 echo "************************************************************"
 echo "***   System Name    : $HOSTNAME"
 echo "***   OS             : $OS_INFO"
@@ -106,22 +106,13 @@ trap 'rm -f "$FOUND_LIST"' EXIT
 
 TOTAL_FILES=0
 
-# stat wrapper (Linux/macOS)
+# stat wrapper (Linux)
 get_mtime() {
   local path="$1"
   local epoch
 
   epoch=$(stat -c '%Y' "$path" 2>/dev/null || return 1)
   date -d "@$epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown"
-
-  # local path="$1"
-  # if stat --version >/dev/null 2>&1; then
-  #   # GNU stat (Linux)
-  #   stat -c '%Y-%m-%d %H:%M:%S' "$path"
-  # else
-  #   # BSD stat (macOS)
-  #   stat -f '%Sm' -t '%Y-%m-%d %H:%M:%S' "$path"
-  # fi
 }
 
 # Scan a given directory root
@@ -152,8 +143,7 @@ scan_dir() {
       \( \
         -name ".cache" -o \
         -name ".Trash" -o \
-        -path "*/.local/share/Trash/*" -o \
-        -path "*/Library/*" \
+        -path "*/.local/share/Trash/*" \
       \) -prune -o \
       -type f \
       \( \
@@ -198,21 +188,13 @@ for kw in "${ALL_KEYWORDS[@]}"; do
 done
 
 #######################################
-# Scan user home directories
+# Scan user home directories (Linux)
 #######################################
-OS_TYPE=$(uname)
-
 echo "************************************************************"
 echo "***   Scanning home directories for files modified in last $DAYS days..."
 echo "************************************************************"
 
-USER_BASES=()
-
-if [[ "$OS_TYPE" == "Darwin" ]]; then
-  USER_BASES=(/Users/*)
-else
-  USER_BASES=(/home/*)
-fi
+USER_BASES=(/home/*)
 
 for udir in "${USER_BASES[@]}"; do
   [[ -d "$udir" ]] || continue
@@ -220,11 +202,11 @@ for udir in "${USER_BASES[@]}"; do
 done
 
 #######################################
-# Scan Trash / Recycle Bin equivalents
+# Scan Trash
 #######################################
 echo
 echo "************************************************************"
-echo "***   Scanning Trash / Recycle Bin..."
+echo "***   Scanning Trash ..."
 echo "************************************************************"
 
 for udir in "${USER_BASES[@]}"; do
@@ -242,7 +224,7 @@ for udir in "${USER_BASES[@]}"; do
 done
 
 #######################################
-# Scan additional mount points (external drives)
+# Scan additional mount points (external drives, Linux)
 #######################################
 echo
 echo "************************************************************"
@@ -251,23 +233,13 @@ echo "************************************************************"
 
 MOUNTS=()
 
-if [[ "$OS_TYPE" == "Darwin" ]]; then
-  # macOS external volumes
-  if [[ -d /Volumes ]]; then
+for base in /media /mnt /run/media; do
+  if [[ -d "$base" ]]; then
     while IFS= read -r mp; do
       MOUNTS+=("$mp")
-    done < <(find /Volumes -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+    done < <(find "$base" -mindepth 1 -maxdepth 2 -type d 2>/dev/null)
   fi
-else
-  # Linux style mounts
-  for base in /media /mnt /run/media; do
-    if [[ -d "$base" ]]; then
-      while IFS= read -r mp; do
-        MOUNTS+=("$mp")
-      done < <(find "$base" -mindepth 1 -maxdepth 2 -type d 2>/dev/null)
-    fi
-  done
-fi
+done
 
 # Deduplicate mounts
 if ((${#MOUNTS[@]} > 0)); then
@@ -276,7 +248,7 @@ if ((${#MOUNTS[@]} > 0)); then
     scan_dir "$mp" "External / Additional mount"
   done
 else
-  echo "***   No additional mount points detected under /media, /mnt, /run/media, /Volumes."
+  echo "***   No additional mount points detected under /media, /mnt, /run/media."
 fi
 
 #######################################
