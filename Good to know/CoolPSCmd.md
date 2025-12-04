@@ -24,3 +24,15 @@ Select-String -Path "C:\path\to\file" -Pattern "[ -~]{4,}" -AllMatches |
     Select-Object -ExpandProperty Matches |
     Select-Object -ExpandProperty Value
 ```
+
+### 4) Read files in bytes -> convert to base64 and save to txt -> then original file
+```powershell
+# To base64
+$bytes = [io.file]::Readallbytes("C:\Intel® Wi-Fi 6E AX211 160MHz Ver 23.20.0.4.zip")
+$base64=[convert]::tobase64string($bytes)
+set-content -path "c:\bytes.b64.txt" -value $base64 -encoding ASCII
+
+$base64 = get-content "c:\bytes.b64.txt" -raw
+$bytes = [convert]::frombase64string($base64)
+[io.file]::writeallbytes("c:\driver.zip", $bytes)
+```
