@@ -18,9 +18,10 @@ if (-not (Test-Path $DstFile)) {
 }
 
 Write-Host "`n[+] Reading source file..."
+$bytes = [io.file]::ReadAllBytes($SrcFile)
+$base64 = [convert]::ToBase64String($bytes)
+Write-Host "   Total length of the file in Base64 encoded format: $($base64.Length) chars"
 
-$content = Get-Content $SrcFile -Raw
-Write-Host "   Total Length: $($content.Length) chars"
 
 
 
@@ -78,15 +79,14 @@ catch {
 Start-Sleep -Milliseconds 200
 
 Write-Host "`n[+] Start writing file..."
-for ($i=0; $i -lt $content.Length; $i+=$ChunkSize) {
-	$remaining = $content.Length - $i
+for ($i=0; $i -lt $base64.Length; $i+=$ChunkSize) {
+	$remaining = $base64.Length - $i
 	$len = [Math]::Min($ChunkSize, $remaining)
-	$chunk = $content.Substring($i, $len)
+	$chunk = $base64.Substring($i, $len)
 	
 	Write-Host "   Chunk starting at index $i (length $len) -- paste + save..."
-	
 	Set-Clipboard -Value $chunk
-	Focus-Editor
+	
 	[System.Windows.Forms.SendKeys]::SendWait("^v")
 	Start-Sleep -Milliseconds $DelayAfterPasteMs
 	
