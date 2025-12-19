@@ -98,7 +98,9 @@ for ($i=0; $i -lt $base64.Length; $i+=$ChunkSize) {
 	$len = [Math]::Min($ChunkSize, $remaining)
 	$chunk = $base64.Substring($i, $len)
 	
-	Write-Host "   Chunk starting at index $i (length $len) -- paste + save..."
+	$prog = "{0:p2}" -f ($i / $base64.Length)
+	
+	Write-Host "     [Progress: $prog] Chunk starting at index $i (length $len) -- paste + save..."
 	Set-Clipboard -Value $chunk
 	
 	[System.Windows.Forms.SendKeys]::SendWait("^v")
