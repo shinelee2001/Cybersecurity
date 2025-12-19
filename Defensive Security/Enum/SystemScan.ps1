@@ -1,3 +1,83 @@
+<#
+.SYNOPSIS
+NSE Security System Scan — Finds user data files created or modified within the last N days (default 56) and can optionally scan file contents for keywords (including OCR).
+
+.DESCRIPTION
+This script helps identify potential data exfiltration indicators by listing “data-like” files that were created or modified within a selected time window.
+
+Default scan scope:
+- User profiles under C:\Users\ (recursive)
+- Recycle Bin
+- Non-C: partitions and external/removable drives (when readable)
+
+Default exclusions / protections:
+- Skips common system locations (AppData, Windows, Program Files, Program Files (x86))
+- Skips ReparsePoint items (symbolic links, etc.)
+- Skips zero-byte files (commonly cloud-only placeholders)
+
+Optional features:
+- -ContentScan: scans file contents for keywords
+  * TXT/CSV via Select-String
+  * DOCX/PPTX/XLSX by extracting OOXML XML content
+  * Images via Windows built-in OCR
+  * PDFs via page-render + Windows OCR
+- External storage activity signals:
+  * UMDF Operational event log entries (if enabled)
+  * USBSTOR install blocks parsed from setupapi.dev.log (plus FriendlyName lookup)
+
+Output:
+- Console output plus a transcript log file
+- A log is created under %TEMP% and then copied to the script folder ($PSScriptRoot)
+
+Important notes:
+- Content scanning (especially OCR and large drives) can take significant time.
+- OCR requires Windows 10+ and Windows PowerShell (Desktop edition, typically 5.1).
+
+.PARAMETER days
+Number of days to look back. Files are included if CreationTime OR LastWriteTime is within the last N days.
+Default: 56
+
+.PARAMETER contentScan
+If specified, scans file contents for keywords (including OCR for images and PDFs).
+
+.PARAMETER keyWords
+Additional keywords (string array) to search for. These are added to the default keyword list.
+Example: -keyWords "project x","prototype","do not distribute"
+
+.EXAMPLE
+.\SystemScan10.ps1
+Runs the default scan (56 days) and prints matching file paths/timestamps.
+
+.EXAMPLE
+.\SystemScan10.ps1 -days 14
+Scans for files created/modified within the last 14 days.
+
+.EXAMPLE
+.\SystemScan10.ps1 -contentScan
+Runs file discovery + content scanning using the default keywords (includes OCR).
+
+.EXAMPLE
+.\SystemScan10.ps1 -days 30 -contentScan -keyWords "battery","supplier","drawing"
+Scans the last 30 days, enables content scanning, and adds extra keywords.
+
+.OUTPUTS
+Console output + transcript log file (LOG).
+
+.NOTES
+Author / Changelog:
+- Ian Douglas 2025-04-14
+- Owen Tan    2025-07-16  Release 9
+- Dongchan Lee 2025-10-23 Minor fixes (skip cloud-only/zero-byte)
+- Dongchan Lee 2025-10-31 Release 10.1 (content scanning)
+- Dongchan Lee 2025-11-05 Release 10.2 (stability fixes)
+- Dongchan Lee 2025-11-24 Release 10.3 (removable drive scan + OCR integration)
+
+Tip:
+Get-Help .\SystemScan10.ps1 -Examples
+Get-Help .\SystemScan10.ps1 -Detailed
+#>
+
+
 # SystemScan10.ps1
 # 
 # NSE Security System Scan Report PowerShell Script
@@ -275,7 +355,7 @@ if ($foundFiles.Count -gt 0) {
 #
 
 # Define keywords to look up in documents
-$defaultKeywords = @('confidential', 'secret', 'nextstar energy', 'nse ', 'esst', 'nextstar')
+$defaultKeywords = @('confidential', 'secret', 'nextstar energy', 'nse', 'esst', 'nextstar')
 if ($keywords) { $defaultKeywords += $keywords }
 
 
@@ -583,7 +663,7 @@ function Get-ImageOcrMatches {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$KeywordPattern,
-        [string]$LanguageTag = 'en-US' # Currently I have fixed 'en-US' now since KeywordPattern has English words only.
+        [string]$LanguageTag = 'en-US' # Currently I fixed 'en-US' since $KeywordPattern has English words only.
     )
 
     Initialize-OcrWinRT
@@ -724,11 +804,12 @@ if ($contentScan) {
 			$ext = $fileFullName.Split('.')[-1]
 			
 			# scan txt files
-			if ($ext -eq 'txt') {
-				$keywordFound = Select-String -Path $fileFullName -Pattern $keywordPtn -SimpleMatch -ErrorAction SilentlyContinue
+			if ($ext -in @('txt', 'csv')) {
+				$fileFullName
+				$keywordFound = Select-String -Path $fileFullName -Pattern $keywordPtn -ErrorAction SilentlyContinue
 				
 				if ($keywordFound) {
-					$matches = Select-String -Path $fileFullName -Pattern $keywordPtn -SimpleMatch -ErrorAction SilentlyContinue
+					$matches = Select-String -Path $fileFullName -Pattern $keywordPtn -ErrorAction SilentlyContinue
 					$matchedLines = @()
 					
 					foreach ($m in $matches) {
@@ -929,7 +1010,6 @@ foreach ($b in $blocks) {
 		$entryDate = [datetime]::ParseExact($dateStr, "yyyy/MM/dd HH:mm:ss", $null)
 		
 		if ($entryDate -ge $dateThreshold) {
-			
 			# (2025-11-05) Look for friendly name stored in registry based on the entry information
 			$friendlyName = "No friendly name found"
 			if ($entry -match '(?i)(?<=USBSTOR#)[^#]+#[^#]+') {
@@ -976,20 +1056,20 @@ Stop-Transcript
 
 
 
-# # # Copying the logFile to the directory where the script is located (2025-10-23)
-# $destPath = $PSScriptRoot
-# Write-Host "`n"
-# if (Test-Path $logFile) {
-# 	try {
-# 		Copy-Item -Path $logFile -Destination $destPath -ErrorAction Stop
-# 		$logFileName = $logFile.Split('\')[-1]
-# 		$filePath = Join-Path -Path $destPath -ChildPath $logFileName
-# 		Write-Host "The file successfully copied to: " -NoNewline
-# 		Write-Host "$filePath"
-# 	} catch {
-# 		Write-Host "Something went wrong while copying the file: " -NoNewline
-# 		Write-Host "$($_.Exception.Message)" -ForegroundColor Red
-# 	}
-# } else {
-# 	Write-Host "Cannot find the log file."
-# }
+# # Copying the logFile to the directory where the script is located (2025-10-23)
+$destPath = $PSScriptRoot
+Write-Host "`n"
+if (Test-Path $logFile) {
+	try {
+		Copy-Item -Path $logFile -Destination $destPath -ErrorAction Stop
+		$logFileName = $logFile.Split('\')[-1]
+		$filePath = Join-Path -Path $destPath -ChildPath $logFileName
+		Write-Host "The file successfully copied to: " -NoNewline
+		Write-Host "$filePath"
+	} catch {
+		Write-Host "Something went wrong while copying the file: " -NoNewline
+		Write-Host "$($_.Exception.Message)" -ForegroundColor Red
+	}
+} else {
+	Write-Host "Cannot find the log file."
+}
