@@ -6,14 +6,14 @@
 
 | 파일 | 용도 |
 |---|---|
-| [`01. Linux 사고 초동 대응 · 증거 보존 · 격리`](Linux_Investigation.md#01.-Linux-사고-초동-대응-·-증거-보존-·-격리) | 사고 발생 직후 무엇을 먼저 확인하고 보존할지 |
-| [`02. Linux 로그 구조 · 수집 · 분석 기초`](Linux_Investigation.md#02.-Linux-로그-구조-·-수집-·-분석-기초) | `/var/log`, journald, auditd, 세션 기록과 기본 검색법 |
-| [`03. SSH · PAM · 인증 · 세션 분석`](Linux_Investigation.md#03.-SSH-·-PAM-·-인증-·-세션-분석) | SSH 성공/실패, brute force, spraying, PAM, SSH 터널링 |
-| [`04. 계정 침해 · 권한 상승 · 지속성`](Linux_Investigation.md#04.-계정-침해-·-권한-상승-·-지속성) | sudo/su, 신규 계정, sudoers, SSH key, cron/systemd 지속성 |
-| [`05. 프로세스 · 명령 · 파일 · 네트워크 침해행위 분석`](Linux_Investigation.md#05.-프로세스-·-명령-·-파일-·-네트워크-침해행위-분석) | 프로세스 트리, 위험 명령, 파일 이동, C2, 유출, lateral movement |
-| [`06. auditd · FIM · SELinux · AppArmor`](Linux_Investigation.md#06.-auditd-·-FIM-·-SELinux-·-AppArmor) | auditd 이벤트/규칙, FIM, SELinux/AppArmor 분석 |
-| [`07. SIEM 탐지 룰 · UEBA · 로그 품질`](Linux_Investigation.md#07.-SIEM-탐지-룰-·-UEBA-·-로그-품질) | 탐지 유스케이스, UEBA, 파싱/수집 품질, Splunk/Elastic/Sigma |
-| [`08. 특수 환경: AWS · 컨테이너 · 웹 · Rootkit · 공급망 · Miner`](Linux_Investigation.md#08.-특수-환경:-AWS-·-컨테이너-·-웹-·-Rootkit-·-공급망-·-Miner) | AWS EC2, Docker/Kubernetes, 웹 로그, rootkit, 공급망, miner |
+| [`01. Linux 사고 초동 대응 · 증거 보존 · 격리`](Linux_Investigation.md##01.-Linux-사고-초동-대응-·-증거-보존-·-격리) | 사고 발생 직후 무엇을 먼저 확인하고 보존할지 |
+| [`02. Linux 로그 구조 · 수집 · 분석 기초`](Linux_Investigation.md##02.-Linux-로그-구조-·-수집-·-분석-기초) | `/var/log`, journald, auditd, 세션 기록과 기본 검색법 |
+| [`03. SSH · PAM · 인증 · 세션 분석`](Linux_Investigation.md##03.-SSH-·-PAM-·-인증-·-세션-분석) | SSH 성공/실패, brute force, spraying, PAM, SSH 터널링 |
+| [`04. 계정 침해 · 권한 상승 · 지속성`](Linux_Investigation.md##04.-계정-침해-·-권한-상승-·-지속성) | sudo/su, 신규 계정, sudoers, SSH key, cron/systemd 지속성 |
+| [`05. 프로세스 · 명령 · 파일 · 네트워크 침해행위 분석`](Linux_Investigation.md##05.-프로세스-·-명령-·-파일-·-네트워크-침해행위-분석) | 프로세스 트리, 위험 명령, 파일 이동, C2, 유출, lateral movement |
+| [`06. auditd · FIM · SELinux · AppArmor`](Linux_Investigation.md##06.-auditd-·-FIM-·-SELinux-·-AppArmor) | auditd 이벤트/규칙, FIM, SELinux/AppArmor 분석 |
+| [`07. SIEM 탐지 룰 · UEBA · 로그 품질`](Linux_Investigation.md##07.-SIEM-탐지-룰-·-UEBA-·-로그-품질) | 탐지 유스케이스, UEBA, 파싱/수집 품질, Splunk/Elastic/Sigma |
+| [`08. 특수 환경: AWS · 컨테이너 · 웹 · Rootkit · 공급망 · Miner`](Linux_Investigation.md##08.-특수-환경:-AWS-·-컨테이너-·-웹-·-Rootkit-·-공급망-·-Miner) | AWS EC2, Docker/Kubernetes, 웹 로그, rootkit, 공급망, miner |
 
 ## 권장 분석 순서
 
