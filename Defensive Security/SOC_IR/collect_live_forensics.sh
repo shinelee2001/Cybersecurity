@@ -1,132 +1,897 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Linux Live Forensics Triage Collector
-# 원칙: 휘발성 데이터 우선 수집 -> 비휘발성 데이터 확보 -> 수집 파일 해시 무결성 기록
+# Linux Live Forensics Triage Collector v2
+#
+# 목적:
+#   침해사고 발생 Linux 서버에서 초동 대응에 필요한 핵심 아티팩트를
+#   빠르게 수집하기 위한 Live Forensics Triage Collector
+#
+# 원칙:
+#   1. 휘발성 데이터 우선 수집
+#   2. 최소한의 시스템 변경
+#   3. 주요 Persistence / Account / Log 아티팩트 확보
+#   4. 삭제되었으나 실행 중인 파일(/proc/PID/exe) 복구 시도
+#   5. 수집 과정 자체를 기록
+#   6. 수집된 증거 사본에 대해 SHA-256 무결성 매니페스트 생성
+#
+# 권장 실행:
+#   sudo ./linux_triage.sh
+#
+# 외부 증거 저장소 사용:
+#   sudo OUT_BASE=/mnt/evidence ./linux_triage.sh
+#
+# 주의:
+#   Live Forensics는 시스템 상태를 완전히 보존하는 방식이 아니다.
+#   본 스크립트 실행 자체가 프로세스 생성, 파일 접근, 로그 생성,
+#   파일시스템 metadata/cache 변경 등을 유발할 수 있다.
 # ==============================================================================
 
 set -u
 
-# 1. 수집 디렉터리 생성 및 기본 설정
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-HOSTNAME_STR=$(hostname 2>/dev/null || echo "unknown_host")
-OUT_DIR="./evidence_${HOSTNAME_STR}_${TIMESTAMP}"
-
-mkdir -p "${OUT_DIR}/volatile"
-mkdir -p "${OUT_DIR}/non_volatile"
-mkdir -p "${OUT_DIR}/files"
-
-echo "[+] 포렌식 데이터 수집 시작: ${TIMESTAMP}"
-echo "[+] 증거 저장 경로: ${OUT_DIR}"
-
 # ------------------------------------------------------------------------------
-# 1. 휘발성 데이터 수집 (Order of Volatility 준수)
+# 0. 기본 환경 설정
 # ------------------------------------------------------------------------------
 
-# ① 시스템 기본 상태
-echo "[*] (1/8) 시스템 기본 상태 수집 중..."
-{
-    echo "=== DATE ==="; date -u; date
-    echo -e "\n=== UPTIME ==="; uptime
-    echo -e "\n=== HOSTNAME & UNAME ==="; hostname; uname -a
-} > "${OUT_DIR}/volatile/01_system_status.txt" 2>&1
+umask 077
 
-# ② 전체 프로세스 트리
-echo "[*] (2/8) 프로세스 계보 및 트리 수집 중..."
-{
-    echo "=== PS AUXF ==="; ps auxf
-    echo -e "\n=== PS -EF --FOREST ==="; ps -ef --forest 2>/dev/null
-} > "${OUT_DIR}/volatile/02_process_tree.txt" 2>&1
+export LC_ALL=C
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-# ③ 네트워크 연결
-echo "[*] (3/8) 활성 네트워크 소켓 및 연결 상태 수집 중..."
-{
-    echo "=== SS -TULNP ==="; ss -tulnp
-    echo -e "\n=== SS -TANP ==="; ss -tanp
-    echo -e "\n=== NETSTAT -ANP ==="; netstat -anp 2>/dev/null
-} > "${OUT_DIR}/volatile/03_network_connections.txt" 2>&1
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+HOSTNAME_STR="$(hostname 2>/dev/null || echo "unknown_host")"
 
-# ④ 열린 파일 / 소켓 및 삭제된 실행 파일(Deleted) 추적
-echo "[*] (4/8) 열린 파일 디스크립터 및 unlinked 프로세스 파일 수집 중..."
-{
-    echo "=== LSOF -I ==="; lsof -i 2>/dev/null
-    echo -e "\n=== LSOF (DELETED FILES) ==="; lsof 2>/dev/null | grep -E 'deleted|DEL'
-} > "${OUT_DIR}/volatile/04_open_files_and_sockets.txt" 2>&1
+# 기본값은 현재 디렉터리.
+# 외장 디스크 / IR Storage 사용 시:
+# OUT_BASE=/mnt/evidence ./linux_triage.sh
+OUT_BASE="${OUT_BASE:-.}"
 
-# ⑤ 현재 로그인 세션 및 접속 이력
-echo "[*] (5/8) 로그인 세션 및 사용자 히스토리 수집 중..."
-{
-    echo "=== WHO ==="; who
-    echo -e "\n=== W ==="; w
-    echo -e "\n=== LAST (TOP 50) ==="; last -n 50 2>/dev/null
-    echo -e "\n=== LASTLOG ==="; lastlog 2>/dev/null
-} > "${OUT_DIR}/volatile/05_user_sessions.txt" 2>&1
+OUT_DIR="${OUT_BASE}/evidence_${HOSTNAME_STR}_${TIMESTAMP}"
 
-# ⑥ 네트워크 테이블 (ARP & Routing)
-echo "[*] (6/8) ARP 테이블 및 라우팅 정보 수집 중..."
-{
-    echo "=== ARP -A ==="; arp -a 2>/dev/null || ip neigh
-    echo -e "\n=== ROUTE -N ==="; route -n 2>/dev/null || ip route
-} > "${OUT_DIR}/volatile/06_network_routing_tables.txt" 2>&1
+VOLATILE_DIR="${OUT_DIR}/volatile"
+NON_VOLATILE_DIR="${OUT_DIR}/non_volatile"
+FILES_DIR="${OUT_DIR}/files"
+META_DIR="${OUT_DIR}/metadata"
 
-# ⑦ 임시 디렉터리 파일 점검 (/tmp, /dev/shm)
-echo "[*] (7/8) 임시 실행 경로(/tmp, /dev/shm) 아티팩트 목록화 중..."
-{
-    echo "=== FIND /tmp -ls ==="; find /tmp -ls 2>/dev/null
-    echo -e "\n=== FIND /dev/shm -ls ==="; find /dev/shm -ls 2>/dev/null
-    echo -e "\n=== FIND /var/tmp -ls ==="; find /var/tmp -ls 2>/dev/null
-} > "${OUT_DIR}/volatile/07_temp_directories.txt" 2>&1
+mkdir -p \
+    "${VOLATILE_DIR}" \
+    "${NON_VOLATILE_DIR}" \
+    "${FILES_DIR}" \
+    "${META_DIR}"
 
-# ⑧ 스케줄러(Cron) 등록 작업
-echo "[*] (8/8) Crontab 및 스케줄러 등록 작업 수집 중..."
-{
-    echo "=== CRONTAB (CURRENT USER) ==="; crontab -l 2>/dev/null
-    echo -e "\n=== CRONTAB (ROOT) ==="; crontab -u root -l 2>/dev/null
-    echo -e "\n=== /etc/crontab & /etc/cron.* ==="
-    cat /etc/crontab 2>/dev/null
-    ls -la /etc/cron.* /var/spool/cron/ 2>/dev/null
-} > "${OUT_DIR}/volatile/08_cron_schedules.txt" 2>&1
+COLLECTION_LOG="${META_DIR}/collection.log"
+
 
 # ------------------------------------------------------------------------------
-# 2. 비휘발성 데이터 및 중요 파일 보존
+# Helper Functions
 # ------------------------------------------------------------------------------
 
-# ⑨ 로그 디렉터리 아카이브 (/var/log/)
-echo "[*] (9/13) /var/log 디렉터리 압축 백업 중..."
-tar -czf "${OUT_DIR}/non_volatile/var_log_archive.tar.gz" /var/log/ 2>/dev/null
+log()
+{
+    local msg="$1"
 
-# ⑩ auditd 감사 로그 복사 (/var/log/audit/)
-echo "[*] (10/13) auditd 로그 보존 중..."
-if [ -d "/var/log/audit" ]; then
-    mkdir -p "${OUT_DIR}/files/audit_logs"
-    cp -r /var/log/audit/* "${OUT_DIR}/files/audit_logs/" 2>/dev/null
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] ${msg}" \
+        | tee -a "${COLLECTION_LOG}"
+}
+
+
+command_exists()
+{
+    command -v "$1" >/dev/null 2>&1
+}
+
+
+section()
+{
+    echo
+    echo "=============================================================================="
+    echo "$1"
+    echo "=============================================================================="
+}
+
+
+# ------------------------------------------------------------------------------
+# 0-1. 수집 시작 메타데이터
+# ------------------------------------------------------------------------------
+
+log "[+] Linux Live Forensics Triage Collector 시작"
+log "[+] Hostname: ${HOSTNAME_STR}"
+log "[+] Evidence path: ${OUT_DIR}"
+
+if [ "${EUID}" -ne 0 ]; then
+    log "[!] WARNING: root 권한이 아닙니다."
+    log "[!] 일부 프로세스, 네트워크, audit, SSH, systemd 증거가 누락될 수 있습니다."
 fi
 
-# ⑪ SSH 인가 키 파일 백업 (authorized_keys)
-echo "[*] (11/13) 시스템 전역 SSH authorized_keys 수집 중..."
-mkdir -p "${OUT_DIR}/files/ssh_keys"
-find /root /home -maxdepth 3 -name "authorized_keys" -exec cp --parents {} "${OUT_DIR}/files/ssh_keys/" \; 2>/dev/null
 
-# ⑫ Systemd 서비스 유닛 파일 수집
-echo "[*] (12/13) 커스텀 서비스 유닛 파일(/etc/systemd/system/) 복사 중..."
-mkdir -p "${OUT_DIR}/files/systemd_services"
-cp -r /etc/systemd/system/*.service "${OUT_DIR}/files/systemd_services/" 2>/dev/null
-
-# ⑬ 임시 폴더 내 의심 파일 해시값 계산
-echo "[*] (13/13) /tmp 및 /dev/shm 내 전체 파일 해시 기록 중..."
+# Collector 자체 정보 기록
 {
-    find /tmp /dev/shm /var/tmp -type f -exec sha256sum {} + 2>/dev/null
-    find /tmp /dev/shm /var/tmp -type f -exec md5sum {} + 2>/dev/null
-} > "${OUT_DIR}/non_volatile/temp_files_hashes.txt" 2>&1
+    section "COLLECTION INFORMATION"
+
+    echo "UTC Start Time:"
+    date -u '+%Y-%m-%dT%H:%M:%SZ'
+
+    echo
+    echo "Local Start Time:"
+    date '+%Y-%m-%dT%H:%M:%S%z'
+
+    echo
+    echo "Hostname:"
+    hostname 2>/dev/null
+
+    echo
+    echo "Collector PID:"
+    echo "$$"
+
+    echo
+    echo "Collector User:"
+    id
+
+    echo
+    echo "Working Directory:"
+    pwd
+
+    echo
+    echo "Output Directory:"
+    echo "${OUT_DIR}"
+
+    echo
+    echo "Collector Script:"
+    echo "$0"
+
+    if [ -f "$0" ] && command_exists sha256sum; then
+        echo
+        echo "Collector SHA256:"
+        sha256sum "$0"
+    fi
+
+} > "${META_DIR}/collection_metadata.txt" 2>&1
+
+
+# ==============================================================================
+# 1. 휘발성 데이터
+# ==============================================================================
 
 # ------------------------------------------------------------------------------
-# 3. 법적 증거 무결성 유지: 수집된 모든 아티팩트 즉시 해시화
+# 1. 시스템 상태
 # ------------------------------------------------------------------------------
-echo "[*] 수집된 모든 증거 파일의 SHA256 / MD5 무결성 해시 매니페스트 생성 중..."
-cd "${OUT_DIR}" || exit 1
-find . -type f ! -name "MANIFEST_*" -exec sha256sum {} + > "MANIFEST_SHA256.txt"
-find . -type f ! -name "MANIFEST_*" -exec md5sum {} + > "MANIFEST_MD5.txt"
-cd - > /dev/null
 
-echo -e "\n[+] 모든 라이브 포렌식 데이터 수집 완료."
-echo "[+] 결과 폴더: ${OUT_DIR}"
-echo "[+] 해시 매니페스트: ${OUT_DIR}/MANIFEST_SHA256.txt"
+log "[*] (1/12) 시스템 기본 상태 수집"
+
+{
+    section "UTC DATE"
+    date -u '+%Y-%m-%dT%H:%M:%SZ'
+
+    section "LOCAL DATE"
+    date '+%Y-%m-%dT%H:%M:%S%z'
+
+    section "UPTIME"
+    uptime
+
+    section "HOSTNAME"
+    hostname
+
+    section "UNAME"
+    uname -a
+
+    section "OS RELEASE"
+    cat /etc/os-release 2>/dev/null
+
+    section "CURRENT USER"
+    id
+
+    section "ENVIRONMENT"
+    env 2>/dev/null
+
+} > "${VOLATILE_DIR}/01_system_status.txt" 2>&1
+
+
+# ------------------------------------------------------------------------------
+# 2. 프로세스
+# ------------------------------------------------------------------------------
+
+log "[*] (2/12) 프로세스 트리 수집"
+
+{
+    section "PS AUXF"
+    ps auxf
+
+    section "PS -EF --FOREST"
+    ps -ef --forest 2>/dev/null
+
+    section "PS -EO"
+    ps -eo \
+        user,pid,ppid,lstart,etime,%cpu,%mem,args \
+        --sort=pid 2>/dev/null
+
+} > "${VOLATILE_DIR}/02_process_tree.txt" 2>&1
+
+
+# ------------------------------------------------------------------------------
+# 3. /proc 프로세스 스냅샷
+# ------------------------------------------------------------------------------
+
+log "[*] (3/12) /proc 프로세스 상세 정보 수집"
+
+{
+    for proc in /proc/[0-9]*; do
+
+        [ -d "${proc}" ] || continue
+
+        pid="${proc##*/}"
+
+        echo
+        echo "=============================================================================="
+        echo "PID: ${pid}"
+        echo "=============================================================================="
+
+        echo -n "EXE: "
+        readlink "${proc}/exe" 2>/dev/null
+        echo
+
+        echo -n "CWD: "
+        readlink "${proc}/cwd" 2>/dev/null
+        echo
+
+        echo -n "ROOT: "
+        readlink "${proc}/root" 2>/dev/null
+        echo
+
+        echo -n "CMDLINE: "
+        tr '\0' ' ' < "${proc}/cmdline" 2>/dev/null
+        echo
+
+        echo
+        echo "--- STATUS ---"
+        grep -E \
+            '^(Name|State|Tgid|Pid|PPid|TracerPid|Uid|Gid|Threads|CapInh|CapPrm|CapEff|CapBnd|Seccomp):' \
+            "${proc}/status" 2>/dev/null
+
+    done
+
+} > "${VOLATILE_DIR}/03_proc_snapshot.txt" 2>&1
+
+
+# ------------------------------------------------------------------------------
+# 4. 삭제된 실행파일 탐지 및 복구
+# ------------------------------------------------------------------------------
+
+log "[*] (4/12) 삭제된 실행파일(deleted executable) 탐지 및 복구"
+
+DELETED_DIR="${FILES_DIR}/deleted_executables"
+
+mkdir -p "${DELETED_DIR}"
+
+{
+    for proc in /proc/[0-9]*; do
+
+        [ -d "${proc}" ] || continue
+
+        pid="${proc##*/}"
+
+        exe="$(readlink "${proc}/exe" 2>/dev/null || true)"
+
+        if [[ "${exe}" == *"(deleted)"* ]]; then
+
+            echo "PID=${pid}"
+            echo "EXE=${exe}"
+
+            echo -n "CMDLINE="
+            tr '\0' ' ' < "${proc}/cmdline" 2>/dev/null
+            echo
+
+            echo
+
+            # 실행 중인 deleted binary 복구 시도
+            cp --preserve=all \
+                "${proc}/exe" \
+                "${DELETED_DIR}/${pid}_exe" \
+                2>/dev/null || true
+
+        fi
+
+    done
+
+} > "${VOLATILE_DIR}/04_deleted_executables.txt" 2>&1
+
+
+# ------------------------------------------------------------------------------
+# 5. 네트워크 연결 / Listening Socket
+# ------------------------------------------------------------------------------
+
+log "[*] (5/12) 네트워크 연결 및 Listening Socket 수집"
+
+{
+    if command_exists ss; then
+
+        section "SS -TULNP"
+        ss -tulnp
+
+        section "SS -TANP"
+        ss -tanp
+
+        section "SS -UANP"
+        ss -uanp
+
+    fi
+
+    if command_exists netstat; then
+
+        section "NETSTAT -ANP"
+        netstat -anp
+
+    fi
+
+} > "${VOLATILE_DIR}/05_network_connections.txt" 2>&1
+
+
+# ------------------------------------------------------------------------------
+# 6. 네트워크 인터페이스 / Routing / ARP / DNS
+# ------------------------------------------------------------------------------
+
+log "[*] (6/12) 네트워크 구성 정보 수집"
+
+{
+    section "IP ADDR"
+    ip addr 2>/dev/null
+
+    section "IP LINK"
+    ip link 2>/dev/null
+
+    section "IP ROUTE"
+    ip route 2>/dev/null
+
+    section "IP RULE"
+    ip rule 2>/dev/null
+
+    section "IP NEIGH"
+    ip neigh 2>/dev/null
+
+    if command_exists arp; then
+        section "ARP -AN"
+        arp -an 2>/dev/null
+    fi
+
+    section "DNS /etc/resolv.conf"
+    cat /etc/resolv.conf 2>/dev/null
+
+    section "/etc/hosts"
+    cat /etc/hosts 2>/dev/null
+
+} > "${VOLATILE_DIR}/06_network_configuration.txt" 2>&1
+
+
+# ------------------------------------------------------------------------------
+# 7. Firewall
+# ------------------------------------------------------------------------------
+
+log "[*] (7/12) Firewall 규칙 수집"
+
+{
+    if command_exists nft; then
+
+        section "NFTABLES RULESET"
+        nft list ruleset 2>/dev/null
+
+    fi
+
+    if command_exists iptables-save; then
+
+        section "IPTABLES"
+        iptables-save 2>/dev/null
+
+    elif command_exists iptables; then
+
+        section "IPTABLES -L -N -V"
+        iptables -L -n -v 2>/dev/null
+
+    fi
+
+    if command_exists ip6tables-save; then
+
+        section "IP6TABLES"
+        ip6tables-save 2>/dev/null
+
+    fi
+
+    if command_exists ufw; then
+
+        section "UFW STATUS"
+        ufw status verbose 2>/dev/null
+
+    fi
+
+    if command_exists firewall-cmd; then
+
+        section "FIREWALLD"
+        firewall-cmd --list-all-zones 2>/dev/null
+
+    fi
+
+} > "${VOLATILE_DIR}/07_firewall_rules.txt" 2>&1
+
+
+# ------------------------------------------------------------------------------
+# 8. 열린 파일 / Socket / Deleted file
+# ------------------------------------------------------------------------------
+
+log "[*] (8/12) 열린 파일 및 Socket 수집"
+
+{
+    if command_exists lsof; then
+
+        section "LSOF NETWORK"
+        lsof -nP -i 2>/dev/null
+
+        section "LSOF DELETED"
+        lsof -nP 2>/dev/null | grep -Ei 'deleted|DEL'
+
+    else
+
+        echo "lsof command not available"
+
+    fi
+
+} > "${VOLATILE_DIR}/08_open_files_and_sockets.txt" 2>&1
+
+
+# ------------------------------------------------------------------------------
+# 9. 로그인 세션
+# ------------------------------------------------------------------------------
+
+log "[*] (9/12) 로그인 세션 및 접속 이력 수집"
+
+{
+    section "WHO"
+    who
+
+    section "W"
+    w
+
+    section "LAST"
+    last -n 100 2>/dev/null
+
+    section "LASTLOG"
+    lastlog 2>/dev/null
+
+    if command_exists loginctl; then
+
+        section "LOGINCTL"
+        loginctl list-sessions 2>/dev/null
+
+    fi
+
+} > "${VOLATILE_DIR}/09_user_sessions.txt" 2>&1
+
+
+# ------------------------------------------------------------------------------
+# 10. Kernel 상태
+# ------------------------------------------------------------------------------
+
+log "[*] (10/12) Kernel 및 Module 상태 수집"
+
+{
+    section "LSMOD"
+    lsmod 2>/dev/null
+
+    section "/proc/modules"
+    cat /proc/modules 2>/dev/null
+
+    section "DMESG"
+    dmesg -T 2>/dev/null
+
+    section "KERNEL TAINT"
+    cat /proc/sys/kernel/tainted 2>/dev/null
+
+} > "${VOLATILE_DIR}/10_kernel_state.txt" 2>&1
+
+
+# ------------------------------------------------------------------------------
+# 11. Mount / Storage
+# ------------------------------------------------------------------------------
+
+log "[*] (11/12) Mount 및 Storage 상태 수집"
+
+{
+    section "FINDMNT"
+    findmnt 2>/dev/null
+
+    section "MOUNT"
+    mount
+
+    section "LSBLK"
+    lsblk -f 2>/dev/null
+
+    section "DF"
+    df -hT
+
+    section "/proc/mounts"
+    cat /proc/mounts 2>/dev/null
+
+} > "${VOLATILE_DIR}/11_mount_storage.txt" 2>&1
+
+
+# ------------------------------------------------------------------------------
+# 12. 임시 디렉터리
+# ------------------------------------------------------------------------------
+
+log "[*] (12/12) 임시 디렉터리 아티팩트 목록 수집"
+
+{
+    section "/tmp"
+    find /tmp -xdev -ls 2>/dev/null
+
+    section "/var/tmp"
+    find /var/tmp -xdev -ls 2>/dev/null
+
+    section "/dev/shm"
+    find /dev/shm -xdev -ls 2>/dev/null
+
+} > "${VOLATILE_DIR}/12_temp_directories.txt" 2>&1
+
+
+# ==============================================================================
+# 2. Persistence
+# ==============================================================================
+
+log "[*] Persistence 정보 수집"
+
+
+# ------------------------------------------------------------------------------
+# Cron
+# ------------------------------------------------------------------------------
+
+{
+    section "CURRENT USER CRONTAB"
+    crontab -l 2>/dev/null
+
+    section "ROOT CRONTAB"
+    crontab -u root -l 2>/dev/null
+
+    section "/etc/crontab"
+    cat /etc/crontab 2>/dev/null
+
+    section "/etc/cron.*"
+    ls -la \
+        /etc/cron.d \
+        /etc/cron.daily \
+        /etc/cron.hourly \
+        /etc/cron.weekly \
+        /etc/cron.monthly \
+        2>/dev/null
+
+    section "/var/spool/cron"
+    find /var/spool/cron \
+        -maxdepth 3 \
+        -type f \
+        -ls \
+        2>/dev/null
+
+} > "${NON_VOLATILE_DIR}/01_cron_persistence.txt" 2>&1
+
+
+# ------------------------------------------------------------------------------
+# Systemd
+# ------------------------------------------------------------------------------
+
+{
+    if command_exists systemctl; then
+
+        section "ENABLED UNIT FILES"
+        systemctl list-unit-files \
+            --state=enabled \
+            --no-pager \
+            2>/dev/null
+
+        section "RUNNING SERVICES"
+        systemctl list-units \
+            --type=service \
+            --state=running \
+            --no-pager \
+            2>/dev/null
+
+        section "SYSTEMD TIMERS"
+        systemctl list-timers \
+            --all \
+            --no-pager \
+            2>/dev/null
+
+        section "FAILED UNITS"
+        systemctl --failed \
+            --no-pager \
+            2>/dev/null
+
+    fi
+
+} > "${NON_VOLATILE_DIR}/02_systemd_runtime.txt" 2>&1
+
+
+mkdir -p "${FILES_DIR}/systemd"
+
+if [ -d /etc/systemd/system ]; then
+
+    cp -a \
+        /etc/systemd/system \
+        "${FILES_DIR}/systemd/" \
+        2>/dev/null || true
+
+fi
+
+
+# ------------------------------------------------------------------------------
+# SSH Authorized Keys
+# ------------------------------------------------------------------------------
+
+log "[*] SSH authorized_keys 수집"
+
+mkdir -p "${FILES_DIR}/ssh_keys"
+
+find /root /home \
+    -maxdepth 4 \
+    -type f \
+    \( -name "authorized_keys" -o -name "authorized_keys2" \) \
+    -exec cp --parents --preserve=all {} "${FILES_DIR}/ssh_keys/" \; \
+    2>/dev/null
+
+
+# ==============================================================================
+# 3. Accounts / Privilege
+# ==============================================================================
+
+log "[*] 계정 및 권한 상태 수집"
+
+{
+    section "/etc/passwd"
+    cat /etc/passwd 2>/dev/null
+
+    section "/etc/group"
+    cat /etc/group 2>/dev/null
+
+    section "UID 0 ACCOUNTS"
+    awk -F: '$3 == 0 {print}' /etc/passwd 2>/dev/null
+
+    section "INTERACTIVE SHELL ACCOUNTS"
+    awk -F: \
+        '$7 !~ /(nologin|false)$/ {print $1 ":" $3 ":" $6 ":" $7}' \
+        /etc/passwd \
+        2>/dev/null
+
+    section "/etc/sudoers"
+    cat /etc/sudoers 2>/dev/null
+
+    section "/etc/sudoers.d"
+    if [ -d /etc/sudoers.d ]; then
+
+        for file in /etc/sudoers.d/*; do
+
+            [ -f "${file}" ] || continue
+
+            echo
+            echo "### ${file}"
+            cat "${file}" 2>/dev/null
+
+        done
+
+    fi
+
+} > "${NON_VOLATILE_DIR}/03_accounts_privileges.txt" 2>&1
+
+
+# ==============================================================================
+# 4. Logs
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Journald
+# ------------------------------------------------------------------------------
+
+log "[*] systemd journal 수집"
+
+if command_exists journalctl; then
+
+    {
+        section "JOURNAL BOOTS"
+
+        journalctl \
+            --list-boots \
+            --no-pager \
+            2>/dev/null
+
+        section "CURRENT BOOT JOURNAL"
+
+        journalctl \
+            -b \
+            --no-pager \
+            -o short-iso \
+            2>/dev/null
+
+    } > "${NON_VOLATILE_DIR}/04_journal_current_boot.txt" 2>&1
+
+fi
+
+
+# ------------------------------------------------------------------------------
+# /var/log Archive
+# ------------------------------------------------------------------------------
+
+log "[*] /var/log 아카이브 생성"
+
+if [ -d /var/log ]; then
+
+    tar \
+        --acls \
+        --xattrs \
+        --numeric-owner \
+        -czf "${NON_VOLATILE_DIR}/var_log_archive.tar.gz" \
+        /var/log \
+        2>/dev/null || \
+    tar \
+        -czf "${NON_VOLATILE_DIR}/var_log_archive.tar.gz" \
+        /var/log \
+        2>/dev/null || true
+
+fi
+
+
+# ------------------------------------------------------------------------------
+# Auditd
+# ------------------------------------------------------------------------------
+
+log "[*] auditd 로그 보존"
+
+if [ -d /var/log/audit ]; then
+
+    mkdir -p "${FILES_DIR}/audit_logs"
+
+    cp -a \
+        /var/log/audit/. \
+        "${FILES_DIR}/audit_logs/" \
+        2>/dev/null || true
+
+fi
+
+
+# ==============================================================================
+# 5. 임시 디렉터리 파일 해시
+# ==============================================================================
+
+log "[*] /tmp /var/tmp /dev/shm 파일 SHA-256 계산"
+
+{
+    for dir in /tmp /var/tmp /dev/shm; do
+
+        [ -d "${dir}" ] || continue
+
+        echo
+        echo "=============================================================================="
+        echo "${dir}"
+        echo "=============================================================================="
+
+        find "${dir}" \
+            -xdev \
+            -type f \
+            -exec sha256sum {} + \
+            2>/dev/null
+
+    done
+
+} > "${NON_VOLATILE_DIR}/05_temp_files_sha256.txt" 2>&1
+
+
+# ==============================================================================
+# 6. 추가 핵심 파일 보존
+# ==============================================================================
+
+log "[*] 네트워크 / SSH / 보안 설정 파일 보존"
+
+CONFIG_DIR="${FILES_DIR}/configuration"
+
+mkdir -p "${CONFIG_DIR}"
+
+for file in \
+    /etc/hosts \
+    /etc/resolv.conf \
+    /etc/passwd \
+    /etc/group \
+    /etc/sudoers \
+    /etc/ssh/sshd_config
+do
+
+    if [ -f "${file}" ]; then
+
+        cp \
+            --parents \
+            --preserve=all \
+            "${file}" \
+            "${CONFIG_DIR}/" \
+            2>/dev/null || true
+
+    fi
+
+done
+
+
+if [ -d /etc/ssh/sshd_config.d ]; then
+
+    cp -a \
+        /etc/ssh/sshd_config.d \
+        "${CONFIG_DIR}/" \
+        2>/dev/null || true
+
+fi
+
+
+if [ -d /etc/sudoers.d ]; then
+
+    cp -a \
+        /etc/sudoers.d \
+        "${CONFIG_DIR}/" \
+        2>/dev/null || true
+
+fi
+
+
+# ==============================================================================
+# 7. 수집 종료 메타데이터
+# ==============================================================================
+
+{
+    section "UTC END TIME"
+    date -u '+%Y-%m-%dT%H:%M:%SZ'
+
+    section "LOCAL END TIME"
+    date '+%Y-%m-%dT%H:%M:%S%z'
+
+    section "FINAL DISK USAGE"
+    du -sh "${OUT_DIR}" 2>/dev/null
+
+} > "${META_DIR}/collection_end.txt" 2>&1
+
+
+log "[*] 증거 파일 SHA-256 무결성 매니페스트 생성"
+
+
+# ==============================================================================
+# 8. SHA-256 Evidence Manifest
+# ==============================================================================
+
+(
+    cd "${OUT_DIR}" || exit 1
+
+    find . \
+        -type f \
+        ! -name "MANIFEST_SHA256.txt" \
+        -print0 \
+        | sort -z \
+        | xargs -0 sha256sum \
+        > "MANIFEST_SHA256.txt"
+)
+
+
+# Manifest 자체 Hash
+if command_exists sha256sum; then
+
+    sha256sum \
+        "${OUT_DIR}/MANIFEST_SHA256.txt" \
+        > "${OUT_DIR}/MANIFEST_SHA256.txt.sha256"
+
+fi
+
+
+# ==============================================================================
+# 완료
+# ==============================================================================
+
+END_TIMESTAMP="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+log "[+] 모든 Live Forensics 데이터 수집 완료"
+log "[+] 종료 시각: ${END_TIMESTAMP}"
+log "[+] 결과 폴더: ${OUT_DIR}"
+log "[+] SHA256 Manifest: ${OUT_DIR}/MANIFEST_SHA256.txt"
+
+echo
+echo "=============================================================================="
+echo "[+] COLLECTION COMPLETE"
+echo "=============================================================================="
+echo "Evidence Directory : ${OUT_DIR}"
+echo "SHA256 Manifest    : ${OUT_DIR}/MANIFEST_SHA256.txt"
+echo
